@@ -1,0 +1,6 @@
+{
+  "name": "ColorTogether",
+  "description": "A modern, collaborative line-art coloring application with real-time Socket.IO synchronization, split and live coloring modes, and combined masterpiece exports.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
