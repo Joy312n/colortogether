@@ -24,6 +24,7 @@ interface Action {
   y?: number;        // For bucket fill
   color?: string;
   size?: number;
+  timestamp?: number; // Server-assigned order of actions
 }
 
 interface Room {
@@ -36,6 +37,8 @@ interface Room {
   hostId: string;
   emptyTimeout?: NodeJS.Timeout;
   hostTransferTimeout?: NodeJS.Timeout;
+  undoStacks?: { [playerId: string]: Action[] };
+  redoStacks?: { [playerId: string]: Action[] };
 }
 
 async function startServer() {
@@ -51,6 +54,12 @@ async function startServer() {
 
   // Helper to serialize room for sending over socket
   function serializeRoom(room: Room) {
+    const redoCounts: { [playerId: string]: number } = {};
+    if (room.redoStacks) {
+      for (const [pId, stack] of Object.entries(room.redoStacks)) {
+        redoCounts[pId] = stack.length;
+      }
+    }
     return {
       roomCode: room.roomCode,
       mode: room.mode,
@@ -67,6 +76,7 @@ async function startServer() {
       actions: room.actions,
       sessionStarted: room.sessionStarted,
       hostId: room.hostId,
+      redoCounts,
     };
   }
 
@@ -183,6 +193,8 @@ async function startServer() {
         actions: [],
         sessionStarted: false,
         hostId: playerId,
+        undoStacks: {},
+        redoStacks: {},
       };
 
       rooms.set(roomCode, newRoom);
@@ -357,14 +369,21 @@ async function startServer() {
       const playerId = socket.data.playerId || action.playerId;
       if (!playerId) return;
 
-      // Add player ID to action for attribution
-      const actionWithPlayer = { ...action, playerId };
+      // Add player ID to action for attribution, plus server timestamp to ensure ordering is preserved
+      const actionWithPlayer = { ...action, playerId, timestamp: Date.now() };
       room.actions.push(actionWithPlayer);
 
-      // In Live mode, sync instantly to other player
-      if (room.mode === "live") {
-        socket.to(code).emit("draw-action-received", actionWithPlayer);
-      }
+      // Store in undo stack
+      if (!room.undoStacks) room.undoStacks = {};
+      if (!room.undoStacks[playerId]) room.undoStacks[playerId] = [];
+      room.undoStacks[playerId].push(actionWithPlayer);
+
+      // Redo history clears when the player creates a new drawing action after an undo
+      if (!room.redoStacks) room.redoStacks = {};
+      room.redoStacks[playerId] = [];
+
+      // Broadcast room update to synchronize everyone
+      io.to(code).emit("room-updated", serializeRoom(room));
     });
 
     // Handle Undo Action
@@ -377,22 +396,69 @@ async function startServer() {
       const playerId = socket.data.playerId;
       if (!playerId) return;
 
-      // Find last action drawn by this player and remove it
-      let removedActionId: string | null = null;
+      if (!room.undoStacks) room.undoStacks = {};
+      if (!room.undoStacks[playerId]) room.undoStacks[playerId] = [];
+
+      if (!room.redoStacks) room.redoStacks = {};
+      if (!room.redoStacks[playerId]) room.redoStacks[playerId] = [];
+
+      // Find the last action in room.actions made by this player and remove it
+      let undoneAction: Action | null = null;
       for (let i = room.actions.length - 1; i >= 0; i--) {
         if (room.actions[i].playerId === playerId) {
-          removedActionId = room.actions[i].id;
+          undoneAction = room.actions[i];
           room.actions.splice(i, 1);
           break;
         }
       }
 
-      if (removedActionId) {
-        if (room.mode === "live") {
-          io.to(code).emit("undo-action-received", { playerId, actionId: removedActionId });
-        } else {
-          socket.emit("undo-action-received", { playerId, actionId: removedActionId });
-        }
+      if (undoneAction) {
+        // Push to the player's redoStack
+        room.redoStacks[playerId].push(undoneAction);
+
+        // Filter it from local undo stack as well
+        room.undoStacks[playerId] = room.undoStacks[playerId].filter(act => act.id !== undoneAction!.id);
+
+        console.log(`Player ${playerId} performed UNDO. Redo count: ${room.redoStacks[playerId].length}`);
+
+        // Broadcast room update to synchronize everyone
+        io.to(code).emit("room-updated", serializeRoom(room));
+      }
+    });
+
+    // Handle Redo Action
+    socket.on("redo-action", ({ roomCode }) => {
+      const code = (roomCode || socket.data.roomCode || "").toUpperCase();
+      const room = rooms.get(code);
+
+      if (!room) return;
+
+      const playerId = socket.data.playerId;
+      if (!playerId) return;
+
+      if (!room.undoStacks) room.undoStacks = {};
+      if (!room.undoStacks[playerId]) room.undoStacks[playerId] = [];
+
+      if (!room.redoStacks) room.redoStacks = {};
+      if (!room.redoStacks[playerId]) room.redoStacks[playerId] = [];
+
+      const redoneAction = room.redoStacks[playerId].pop();
+      if (redoneAction) {
+        // Push back to room.actions and to undo stack
+        room.actions.push(redoneAction);
+        room.undoStacks[playerId].push(redoneAction);
+
+        // Sort by timestamp to preserve action order
+        room.actions.sort((a, b) => {
+          const tA = a.timestamp || 0;
+          const tB = b.timestamp || 0;
+          return tA - tB;
+        });
+
+        console.log(`Player ${playerId} performed REDO. Redo count: ${room.redoStacks[playerId].length}`);
+
+        // Broadcast room update to synchronize everyone
+        io.to(code).emit("room-updated", serializeRoom(room));
       }
     });
 
@@ -409,11 +475,33 @@ async function startServer() {
       // Filter out all actions by this player
       room.actions = room.actions.filter(act => act.playerId !== playerId);
 
-      if (room.mode === "live") {
-        io.to(code).emit("canvas-cleared", { playerId });
-      } else {
-        socket.emit("canvas-cleared", { playerId });
-      }
+      // Clear undo and redo stacks for this player since their changes are gone
+      if (!room.undoStacks) room.undoStacks = {};
+      room.undoStacks[playerId] = [];
+
+      if (!room.redoStacks) room.redoStacks = {};
+      room.redoStacks[playerId] = [];
+
+      console.log(`Player ${playerId} cleared their changes.`);
+
+      // Broadcast room update to synchronize everyone
+      io.to(code).emit("room-updated", serializeRoom(room));
+    });
+
+    // Handle Cursor Movement
+    socket.on("cursor-move", ({ roomCode, x, y }) => {
+      const code = (roomCode || socket.data.roomCode || "").toUpperCase();
+      const playerId = socket.data.playerId;
+      if (!playerId || !code) return;
+      socket.to(code).emit("cursor-moved", { playerId, x, y });
+    });
+
+    // Handle Cursor Leaving
+    socket.on("cursor-leave", ({ roomCode }) => {
+      const code = (roomCode || socket.data.roomCode || "").toUpperCase();
+      const playerId = socket.data.playerId;
+      if (!playerId || !code) return;
+      socket.to(code).emit("cursor-left", { playerId });
     });
 
     // Handle Finish Coloring

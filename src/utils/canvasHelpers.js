@@ -102,7 +102,7 @@ export function floodFill(canvas, startX, startY, fillRGB, outlineImageData) {
  * Draws a smooth line of points onto a canvas context.
  * Used for drawing brushes and erasers.
  */
-export function drawBrushPoints(ctx, points, color, size, isEraser = false) {
+export function drawBrushPoints(ctx, points, color, size, isEraser = false, brushType = "hard", opacity = 100, softness = 0) {
   if (points.length < 2) return;
 
   ctx.save();
@@ -117,28 +117,83 @@ export function drawBrushPoints(ctx, points, color, size, isEraser = false) {
     ctx.strokeStyle = color;
   }
 
-  ctx.lineWidth = size;
+  // Brush styling
+  const parsedOpacity = opacity !== undefined ? opacity / 100 : 1;
+  ctx.globalAlpha = parsedOpacity;
+
+  // Let's set some default settings based on brush type if not explicitly set
+  let activeSoftness = softness !== undefined ? softness : 0;
+  let activeSize = size;
+  
+  if (brushType === "soft") {
+    // Soft brush has a default softness if not set or 0
+    if (softness === undefined || softness === 0) {
+      activeSoftness = 70;
+    }
+  } else if (brushType === "marker") {
+    activeSoftness = 0;
+    // Markers are usually semi-transparent by default
+    if (opacity === undefined || opacity === 100) {
+      ctx.globalAlpha = 0.5;
+    }
+  } else if (brushType === "pencil") {
+    activeSoftness = 15;
+    if (opacity === undefined || opacity === 100) {
+      ctx.globalAlpha = 0.35; // pencils are lighter
+    }
+    // Set a pencil texture line dash
+    ctx.setLineDash([1, 2]);
+    activeSize = Math.max(1, size * 0.5); // pencil lines are thin
+  } else if (brushType === "airbrush") {
+    activeSoftness = 100;
+    if (opacity === undefined || opacity === 100) {
+      ctx.globalAlpha = 0.15; // airbrush is very subtle
+    }
+  }
+
+  ctx.lineWidth = activeSize;
   ctx.lineCap = "round";
   ctx.lineJoin = "round";
 
-  // If we only have 2 points (one segment)
-  if (points.length === 2) {
-    ctx.moveTo(points[0], points[1]);
-    ctx.lineTo(points[0], points[1]);
+  // If softness is greater than 0, use the shadow blur trick
+  if (activeSoftness > 0) {
+    const offset = 10000;
+    ctx.shadowColor = isEraser ? "rgba(0,0,0,1)" : color;
+    ctx.shadowBlur = (activeSoftness / 100) * activeSize * 1.2;
+    ctx.shadowOffsetX = offset;
+    ctx.shadowOffsetY = offset;
+    
+    // Helper to draw offset path
+    ctx.moveTo(points[0] - offset, points[1] - offset);
+    if (points.length === 2) {
+      ctx.lineTo(points[0] - offset, points[1] - offset);
+    } else {
+      let i;
+      for (i = 2; i < points.length - 2; i += 2) {
+        const xc = (points[i] + points[i + 2]) / 2;
+        const yc = (points[i + 1] + points[i + 3]) / 2;
+        ctx.quadraticCurveTo(points[i] - offset, points[i + 1] - offset, xc - offset, yc - offset);
+      }
+      if (i < points.length) {
+        ctx.quadraticCurveTo(points[i] - offset, points[i + 1] - offset, points[points.length - 2] - offset, points[points.length - 1] - offset);
+      }
+    }
     ctx.stroke();
   } else {
+    // Normal drawing
     ctx.moveTo(points[0], points[1]);
-    
-    // Draw smooth quadratic curves between points
-    let i;
-    for (i = 2; i < points.length - 2; i += 2) {
-      const xc = (points[i] + points[i + 2]) / 2;
-      const yc = (points[i + 1] + points[i + 3]) / 2;
-      ctx.quadraticCurveTo(points[i], points[i + 1], xc, yc);
-    }
-    // Curve to the last point
-    if (i < points.length) {
-      ctx.quadraticCurveTo(points[i], points[i + 1], points[points.length - 2], points[points.length - 1]);
+    if (points.length === 2) {
+      ctx.lineTo(points[0], points[1]);
+    } else {
+      let i;
+      for (i = 2; i < points.length - 2; i += 2) {
+        const xc = (points[i] + points[i + 2]) / 2;
+        const yc = (points[i + 1] + points[i + 3]) / 2;
+        ctx.quadraticCurveTo(points[i], points[i + 1], xc, yc);
+      }
+      if (i < points.length) {
+        ctx.quadraticCurveTo(points[i], points[i + 1], points[points.length - 2], points[points.length - 1]);
+      }
     }
     ctx.stroke();
   }

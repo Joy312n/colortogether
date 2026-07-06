@@ -4,6 +4,7 @@ import {
   PaintBucket, 
   Eraser, 
   Undo2, 
+  Redo2,
   RotateCcw, 
   CheckSquare, 
   ZoomIn, 
@@ -12,7 +13,14 @@ import {
   Hand,
   CheckCircle,
   HelpCircle,
-  AlertCircle
+  AlertCircle,
+  Pipette,
+  Heart,
+  ChevronDown,
+  ChevronUp,
+  Sliders,
+  Palette,
+  Search
 } from "lucide-react";
 import { drawBrushPoints, floodFill, hexToRgb } from "../utils/canvasHelpers";
 import { useTheme } from "./ThemeContext";
@@ -24,6 +32,77 @@ const PALETTE = [
   "#EAB308", "#F97316", "#EF4444", "#0F172A"
 ];
 
+const PRESET_PALETTES = {
+  "Reds": ["#FF8A8A", "#FF5C5C", "#FF2E2E", "#D60000", "#800000"],
+  "Oranges": ["#FFD08A", "#FFAE5C", "#FF8C2E", "#D66200", "#803B00"],
+  "Yellows": ["#FFF48A", "#FFE95C", "#FFDE2E", "#D6B500", "#806D00"],
+  "Greens": ["#B2FF8A", "#8CFF5C", "#66FF2E", "#42D600", "#278000"],
+  "Teals": ["#8AFFEC", "#5CFFD9", "#2EFFC7", "#00D69F", "#00805F"],
+  "Blues": ["#8AD4FF", "#5CB7FF", "#2E9AFF", "#0070D6", "#004380"],
+  "Purples": ["#C08AFF", "#A15CFF", "#822EFF", "#5A00D6", "#360080"],
+  "Pinks": ["#FF8AE1", "#FF5CD1", "#FF2EC1", "#D60093", "#800058"],
+  "Browns": ["#D7B19D", "#C08A70", "#A66342", "#864525", "#522510"],
+  "Grays": ["#F1F5F9", "#CBD5E1", "#94A3B8", "#475569", "#0F172A"],
+  "Black & White": ["#FFFFFF", "#E2E8F0", "#64748B", "#1E293B", "#000000"],
+  "Pastel Colors": ["#FFB7B2", "#FFDAC1", "#E2F0CB", "#B5EAD7", "#C7CEEA"],
+  "Neon Colors": ["#39FF14", "#FF073A", "#0FF0FC", "#BC13FE", "#FF007F"],
+  "Earth Tones": ["#2C5E3B", "#A9BA9D", "#E2D4B7", "#B87D4B", "#6E473B"],
+  "Skin Tones": ["#F9D3B5", "#F3C096", "#E3A374", "#D18855", "#9B643D"]
+};
+
+// Color conversion helper for HSV / RGB representation
+function hexToHsv(hex) {
+  let [r, g, b] = hexToRgb(hex);
+  r /= 255; g /= 255; b /= 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b);
+  let h, s, v = max;
+  const d = max - min;
+  s = max === 0 ? 0 : d / max;
+  if (max === min) {
+    h = 0; // achromatic
+  } else {
+    switch (max) {
+      case r: h = (g - b) / d + (g < b ? 6 : 0); break;
+      case g: h = (b - r) / d + 2; break;
+      case b: h = (r - g) / d + 4; break;
+    }
+    h /= 6;
+  }
+  return { h: Math.round(h * 360), s: Math.round(s * 100), v: Math.round(v * 100) };
+}
+
+function hsvToHex(h, s, v) {
+  h /= 360; s /= 100; v /= 100;
+  let r, g, b;
+  const i = Math.floor(h * 6);
+  const f = h * 6 - i;
+  const p = v * (1 - s);
+  const q = v * (1 - f * s);
+  const t = v * (1 - (1 - f) * s);
+  switch (i % 6) {
+    case 0: r = v; g = t; b = p; break;
+    case 1: r = q; g = v; b = p; break;
+    case 2: r = p; g = v; b = t; break;
+    case 3: r = p; g = q; b = v; break;
+    case 4: r = t; g = p; b = v; break;
+    case 5: r = v; g = p; b = q; break;
+  }
+  const toHex = x => {
+    const hex = Math.round(x * 255).toString(16);
+    return hex.length === 1 ? '0' + hex : hex;
+  };
+  return `#${toHex(r)}${toHex(g)}${toHex(b)}`.toUpperCase();
+}
+
+function rgbToHex(r, g, b) {
+  const clamp = x => Math.min(255, Math.max(0, Math.round(x)));
+  const toHex = x => {
+    const hex = clamp(x).toString(16);
+    return hex.length === 1 ? '0' + hex : hex;
+  };
+  return `#${toHex(r)}${toHex(g)}${toHex(b)}`.toUpperCase();
+}
+
 export default function ColoringCanvas({ 
   room, 
   playerId, 
@@ -31,9 +110,139 @@ export default function ColoringCanvas({
   onFinishColoring 
 }) {
   const { activeTheme, mode } = useTheme();
-  const [activeTool, setActiveTool] = useState("brush"); // "brush" | "bucket" | "eraser" | "pan"
+  const [activeTool, setActiveTool] = useState("brush"); // "brush" | "bucket" | "eraser" | "pan" | "eyedropper"
   const [brushColor, setBrushColor] = useState("#EC4899");
   const [brushSize, setBrushSize] = useState(12);
+  const [brushType, setBrushType] = useState("hard"); // "hard" | "soft" | "marker" | "pencil" | "airbrush"
+  const [brushOpacity, setBrushOpacity] = useState(100); // 0-100
+  const [brushSoftness, setBrushSoftness] = useState(0); // 0-100
+
+  // Collapsible state controls - "brushSettings" | "colorLibrary" | "advancedPicker" | null
+  // All accordion sections collapsed by default except the currently active one (initialized to null)
+  const [activeAccordion, setActiveAccordion] = useState(null);
+  const [paletteSearchQuery, setPaletteSearchQuery] = useState("");
+
+  const toggleAccordion = (section) => {
+    setActiveAccordion(prev => prev === section ? null : section);
+  };
+
+  // Recent and favorite colors
+  const [recentColors, setRecentColors] = useState(() => {
+    try {
+      const saved = localStorage.getItem("recent_colors");
+      return saved ? JSON.parse(saved) : ["#F43F5E", "#EC4899", "#D946EF", "#8B5CF6", "#3B82F6", "#06B6D4", "#10B981", "#84CC16", "#EAB308", "#F97316", "#EF4444", "#0F172A"].slice(0, 12);
+    } catch {
+      return ["#F43F5E", "#EC4899", "#D946EF", "#8B5CF6", "#3B82F6", "#06B6D4", "#10B981", "#84CC16", "#EAB308", "#F97316", "#EF4444", "#0F172A"].slice(0, 12);
+    }
+  });
+
+  const [favoriteColors, setFavoriteColors] = useState(() => {
+    try {
+      const saved = localStorage.getItem("favorite_colors");
+      return saved ? JSON.parse(saved) : ["#FFB7B2", "#FFDAC1", "#E2F0CB", "#B5EAD7", "#C7CEEA"];
+    } catch {
+      return ["#FFB7B2", "#FFDAC1", "#E2F0CB", "#B5EAD7", "#C7CEEA"];
+    }
+  });
+
+  const addToRecentColors = (color) => {
+    if (!color) return;
+    setRecentColors(prev => {
+      const filtered = prev.filter(c => c.toLowerCase() !== color.toLowerCase());
+      const next = [color, ...filtered].slice(0, 12);
+      try {
+        localStorage.setItem("recent_colors", JSON.stringify(next));
+      } catch (e) {}
+      return next;
+    });
+  };
+
+  const toggleFavoriteColor = (color) => {
+    if (!color) return;
+    setFavoriteColors(prev => {
+      let next;
+      if (prev.some(c => c.toLowerCase() === color.toLowerCase())) {
+        next = prev.filter(c => c.toLowerCase() !== color.toLowerCase());
+      } else {
+        next = [...prev, color];
+      }
+      try {
+        localStorage.setItem("favorite_colors", JSON.stringify(next));
+      } catch (e) {}
+      return next;
+    });
+  };
+
+  const [hexInputText, setHexInputText] = useState(brushColor);
+  useEffect(() => {
+    setHexInputText(brushColor);
+  }, [brushColor]);
+
+  const [activePaletteGroup, setActivePaletteGroup] = useState("Pastel Colors");
+
+  const handleBrushTypeChange = (type) => {
+    setBrushType(type);
+    if (type === "hard") {
+      setBrushSoftness(0);
+      setBrushOpacity(100);
+    } else if (type === "soft") {
+      setBrushSoftness(75);
+      setBrushOpacity(100);
+    } else if (type === "marker") {
+      setBrushSoftness(0);
+      setBrushOpacity(50);
+    } else if (type === "pencil") {
+      setBrushSoftness(15);
+      setBrushOpacity(35);
+    } else if (type === "airbrush") {
+      setBrushSoftness(100);
+      setBrushOpacity(15);
+    }
+  };
+
+  const handleColorSelect = (color) => {
+    setBrushColor(color);
+    addToRecentColors(color);
+    if (activeTool === "eraser" || activeTool === "pan" || activeTool === "eyedropper") {
+      setActiveTool("brush");
+    }
+  };
+
+  const handleHsvChange = (channel, value) => {
+    const currentHsv = hexToHsv(brushColor);
+    const newHsv = { ...currentHsv, [channel]: value };
+    const newHex = hsvToHex(newHsv.h, newHsv.s, newHsv.v);
+    handleColorSelect(newHex);
+  };
+
+  const handleRgbChange = (channel, value) => {
+    let [r, g, b] = hexToRgb(brushColor);
+    const val = Math.min(255, Math.max(0, parseInt(value, 10) || 0));
+    if (channel === 'r') r = val;
+    else if (channel === 'g') g = val;
+    else if (channel === 'b') b = val;
+    const newHex = rgbToHex(r, g, b);
+    handleColorSelect(newHex);
+  };
+
+  const hasEyeDropper = typeof window !== "undefined" && "EyeDropper" in window;
+
+  const triggerNativeEyedropper = async () => {
+    if (!hasEyeDropper) {
+      setActiveTool("eyedropper");
+      return;
+    }
+    try {
+      const eyeDropper = new window.EyeDropper();
+      const result = await eyeDropper.open();
+      if (result && result.sRGBHex) {
+        handleColorSelect(result.sRGBHex);
+      }
+    } catch (err) {
+      console.log("Eyedropper closed or failed", err);
+    }
+  };
+
   const [zoom, setZoom] = useState(1.0);
   const [panOffset, setPanOffset] = useState({ x: 0, y: 0 });
   const [isPanning, setIsPanning] = useState(false);
@@ -48,6 +257,8 @@ export default function ColoringCanvas({
   const isDrawingRef = useRef(false);
   const currentStrokePointsRef = useRef([]); // [x1, y1, x2, y2, ...]
   const localActionIdRef = useRef(0); // For unique local action IDs
+  const lastCursorEmitRef = useRef(0); // For throttling cursor position emissions
+  const [partnerCursor, setPartnerCursor] = useState(null); // { x, y, trail: [{x, y, id}] }
 
   const [dimensions, setDimensions] = useState({ width: 800, height: 800 });
   const [loadedImage, setLoadedImage] = useState(null);
@@ -59,6 +270,9 @@ export default function ColoringCanvas({
   const isP1 = p1?.id === playerId;
   const myPlayer = isP1 ? p1 : p2;
   const partnerPlayer = isP1 ? p2 : p1;
+
+  const hasMyActions = room?.actions?.some(act => act.playerId === playerId) || false;
+  const myRedoCount = room?.redoCounts?.[playerId] || 0;
 
   // Enforce Split Mode region boundaries
   const isSplitMode = room?.mode === "split";
@@ -122,64 +336,9 @@ export default function ColoringCanvas({
       // In split mode, don't show the other player's painting live
       if (isSplitMode) return;
 
-      const { x0, y0, x1, y1, color, size, isEraser } = segment;
-      drawBrushPoints(pctx, [x0, y0, x1, y1], color, size, isEraser);
+      const { x0, y0, x1, y1, color, size, isEraser, brushType: remoteBrushType, opacity: remoteOpacity, softness: remoteSoftness } = segment;
+      drawBrushPoints(pctx, [x0, y0, x1, y1], color, size, isEraser, remoteBrushType, remoteOpacity, remoteSoftness);
       redrawComposite();
-    };
-
-    // Receive committed drawing actions (actions pushed to room history)
-    const handleDrawAction = (action) => {
-      if (action.playerId === playerId) return;
-
-      // In split mode, committed actions from partner are also ignored until finish
-      if (isSplitMode) return;
-
-      // Ensure the action is added to our local room.actions array so that undo or clear doesn't lose it
-      const alreadyExists = room.actions.some(act => act.id === action.id);
-      if (!alreadyExists) {
-        room.actions.push(action);
-      }
-
-      const paintCanvas = paintCanvasRef.current;
-      if (!paintCanvas) return;
-      const pctx = paintCanvas.getContext("2d");
-
-      if (action.type === "brush" || action.type === "eraser") {
-        drawBrushPoints(pctx, action.points, action.color, action.size, action.type === "eraser");
-      } else if (action.type === "bucket") {
-        const outlineCanvas = outlineCanvasRef.current;
-        if (outlineCanvas) {
-          const octx = outlineCanvas.getContext("2d");
-          const outlineImageData = octx.getImageData(0, 0, width, height);
-          floodFill(
-            paintCanvas, 
-            action.x, 
-            action.y, 
-            hexToRgb(action.color), 
-            outlineImageData,
-            0, // For remote, they have full width access unless in split mode (which isn't broadcasted anyway)
-            width
-          );
-        }
-      }
-      redrawComposite();
-    };
-
-    // Receive Undo Action
-    const handleUndoAction = (data) => {
-      if (data && data.actionId) {
-        room.actions = room.actions.filter(act => act.id !== data.actionId);
-      }
-      // Re-fetch room actions and redraw entire canvas layer from history
-      rebuildCanvasFromHistory();
-    };
-
-    // Receive Canvas Clear
-    const handleCanvasCleared = (data) => {
-      if (data && data.playerId) {
-        room.actions = room.actions.filter(act => act.playerId !== data.playerId);
-      }
-      rebuildCanvasFromHistory();
     };
 
     // Receive Partner Finished status
@@ -189,18 +348,44 @@ export default function ColoringCanvas({
       }
     };
 
-    socket.on("draw-action-received", handleDrawAction);
+    // Receive other player's cursor position
+    const handleCursorMoved = (data) => {
+      if (data.playerId === playerId) return;
+      setPartnerCursor(prev => {
+        const now = Date.now();
+        let currentTrail = prev ? prev.trail : [];
+        if (prev) {
+          // Append previous point to trail before moving
+          currentTrail = [...currentTrail, { x: prev.x, y: prev.y, id: now }];
+        }
+        if (currentTrail.length > 8) {
+          currentTrail = currentTrail.slice(-8);
+        }
+        return {
+          x: data.x,
+          y: data.y,
+          trail: currentTrail,
+          lastUpdate: now
+        };
+      });
+    };
+
+    // Receive other player's cursor leave
+    const handleCursorLeft = (data) => {
+      if (data.playerId === playerId) return;
+      setPartnerCursor(null);
+    };
+
     socket.on("paint-live-received", handleLivePaint);
-    socket.on("undo-action-received", handleUndoAction);
-    socket.on("canvas-cleared", handleCanvasCleared);
     socket.on("player-finished", handlePartnerFinished);
+    socket.on("cursor-moved", handleCursorMoved);
+    socket.on("cursor-left", handleCursorLeft);
 
     return () => {
-      socket.off("draw-action-received", handleDrawAction);
       socket.off("paint-live-received", handleLivePaint);
-      socket.off("undo-action-received", handleUndoAction);
-      socket.off("canvas-cleared", handleCanvasCleared);
       socket.off("player-finished", handlePartnerFinished);
+      socket.off("cursor-moved", handleCursorMoved);
+      socket.off("cursor-left", handleCursorLeft);
     };
   }, [socket, playerId, room?.mode]);
 
@@ -290,7 +475,7 @@ export default function ColoringCanvas({
     // Replay all actions
     relevantActions.forEach(action => {
       if (action.type === "brush" || action.type === "eraser") {
-        drawBrushPoints(pctx, action.points, action.color, action.size, action.type === "eraser");
+        drawBrushPoints(pctx, action.points, action.color, action.size, action.type === "eraser", action.brushType, action.opacity, action.softness);
       } else if (action.type === "bucket") {
         floodFill(
           paintCanvas, 
@@ -321,6 +506,27 @@ export default function ColoringCanvas({
 
   // Pointer Down handler
   const handlePointerDown = (e) => {
+    // If eyedropper tool, pick color and return
+    if (activeTool === "eyedropper") {
+      const paintCanvas = paintCanvasRef.current;
+      if (paintCanvas) {
+        const pctx = paintCanvas.getContext("2d");
+        const { x, y } = getCanvasCoords(e);
+        try {
+          const pixel = pctx.getImageData(x, y, 1, 1).data;
+          if (pixel[3] > 0) {
+            const hex = rgbToHex(pixel[0], pixel[1], pixel[2]);
+            handleColorSelect(hex);
+          } else {
+            handleColorSelect("#FFFFFF");
+          }
+        } catch (err) {
+          console.error("Eyedropper failed", err);
+        }
+      }
+      return;
+    }
+
     // If pan tool or right click, pan instead of drawing
     if (activeTool === "pan" || e.button === 1 || e.button === 2) {
       setIsPanning(true);
@@ -358,7 +564,10 @@ export default function ColoringCanvas({
         [x, y, x, y], 
         brushColor, 
         brushSize, 
-        activeTool === "eraser"
+        activeTool === "eraser",
+        brushType,
+        brushOpacity,
+        brushSoftness
       );
       pctx.restore();
       redrawComposite();
@@ -371,7 +580,10 @@ export default function ColoringCanvas({
           x0: x, y0: y, x1: x, y1: y,
           color: brushColor,
           size: brushSize,
-          isEraser: activeTool === "eraser"
+          isEraser: activeTool === "eraser",
+          brushType,
+          opacity: brushOpacity,
+          softness: brushSoftness
         }
       });
     } else if (activeTool === "bucket") {
@@ -418,6 +630,25 @@ export default function ColoringCanvas({
 
   // Pointer Move handler
   const handlePointerMove = (e) => {
+    // Track cursor moves and emit to partner
+    if (!isFinishedLocal && socket && room && !isPanning) {
+      const { x, y } = getCanvasCoords(e);
+      if (x >= 0 && x <= width && y >= 0 && y <= height) {
+        const now = Date.now();
+        if (now - lastCursorEmitRef.current > 40) { // Throttle to ~25 FPS
+          socket.emit("cursor-move", {
+            roomCode: room.roomCode,
+            x,
+            y
+          });
+          lastCursorEmitRef.current = now;
+        }
+      } else {
+        // Left the canvas boundaries, emit leave
+        socket.emit("cursor-leave", { roomCode: room.roomCode });
+      }
+    }
+
     if (isPanning) {
       setPanOffset({
         x: e.clientX - panStart.x,
@@ -463,7 +694,10 @@ export default function ColoringCanvas({
       [x0, y0, boundX, y], 
       brushColor, 
       brushSize, 
-      activeTool === "eraser"
+      activeTool === "eraser",
+      brushType,
+      brushOpacity,
+      brushSoftness
     );
     pctx.restore();
     redrawComposite();
@@ -476,7 +710,10 @@ export default function ColoringCanvas({
         x0, y0, x1: boundX, y1: y,
         color: brushColor,
         size: brushSize,
-        isEraser: activeTool === "eraser"
+        isEraser: activeTool === "eraser",
+        brushType,
+        opacity: brushOpacity,
+        softness: brushSoftness
       }
     });
   };
@@ -499,7 +736,10 @@ export default function ColoringCanvas({
         type: activeTool === "eraser" ? "eraser" : "brush",
         points: [...currentStrokePointsRef.current],
         color: activeTool === "eraser" ? null : brushColor,
-        size: brushSize
+        size: brushSize,
+        brushType: activeTool === "eraser" ? "hard" : brushType,
+        opacity: activeTool === "eraser" ? 100 : brushOpacity,
+        softness: activeTool === "eraser" ? 0 : brushSoftness
       };
 
       // Add locally for instant sync
@@ -514,23 +754,24 @@ export default function ColoringCanvas({
     currentStrokePointsRef.current = [];
   };
 
+  // Pointer Leave handler
+  const handlePointerLeave = () => {
+    handlePointerUp(); // Complete drawing if drawing
+    if (!isFinishedLocal && socket && room) {
+      socket.emit("cursor-leave", { roomCode: room.roomCode });
+    }
+  };
+
   // Undo triggers
   const handleUndo = () => {
     if (isFinishedLocal) return;
     socket.emit("undo-action", { roomCode: room.roomCode });
-    
-    // Optimistic update
-    let undoneId = null;
-    for (let i = room.actions.length - 1; i >= 0; i--) {
-      if (room.actions[i].playerId === playerId) {
-        undoneId = room.actions[i].id;
-        room.actions.splice(i, 1);
-        break;
-      }
-    }
-    if (undoneId) {
-      rebuildCanvasFromHistory();
-    }
+  };
+
+  // Redo triggers
+  const handleRedo = () => {
+    if (isFinishedLocal) return;
+    socket.emit("redo-action", { roomCode: room.roomCode });
   };
 
   // Clear Personal Changes
@@ -538,8 +779,6 @@ export default function ColoringCanvas({
     if (isFinishedLocal) return;
     if (confirm("Are you sure you want to clear all your colored changes on this canvas?")) {
       socket.emit("clear-canvas", { roomCode: room.roomCode });
-      room.actions = room.actions.filter(act => act.playerId !== playerId);
-      rebuildCanvasFromHistory();
     }
   };
 
@@ -604,7 +843,7 @@ export default function ColoringCanvas({
           onPointerDown={handlePointerDown}
           onPointerMove={handlePointerMove}
           onPointerUp={handlePointerUp}
-          onPointerLeave={handlePointerUp}
+          onPointerLeave={handlePointerLeave}
           onContextMenu={(e) => e.preventDefault()}
         >
           {/* Hardware-accelerated Transform Wrapper */}
@@ -632,6 +871,62 @@ export default function ColoringCanvas({
                 }
               }
             />
+
+            {/* Other Player Cursor & Trailing Effect */}
+            {partnerCursor && (
+              <div className="absolute inset-0 pointer-events-none overflow-hidden z-30">
+                {/* Render trailing dots with decreasing opacity */}
+                {partnerCursor.trail.map((pt, idx) => {
+                  const opacity = ((idx + 1) / (partnerCursor.trail.length + 1)) * 0.45;
+                  const scale = ((idx + 1) / (partnerCursor.trail.length + 1)) * 0.9 + 0.1;
+                  return (
+                    <div
+                      key={pt.id + "-" + idx}
+                      style={{
+                        left: `${(pt.x / width) * 100}%`,
+                        top: `${(pt.y / height) * 100}%`,
+                        backgroundColor: partnerPlayer?.color || "#3B82F6",
+                        opacity: opacity,
+                        transform: `translate(-50%, -50%) scale(${scale})`,
+                        boxShadow: `0 0 4px ${partnerPlayer?.color || "#3B82F6"}`,
+                      }}
+                      className="absolute w-3 h-3 rounded-full pointer-events-none transition-all duration-100 ease-out"
+                    />
+                  );
+                })}
+
+                {/* Main Cursor Marker */}
+                <div
+                  style={{
+                    left: `${(partnerCursor.x / width) * 100}%`,
+                    top: `${(partnerCursor.y / height) * 100}%`,
+                    transform: "translate(-50%, -50%)",
+                  }}
+                  className="absolute pointer-events-none z-40"
+                >
+                  {/* Outer glowing ring */}
+                  <div 
+                    style={{ borderColor: partnerPlayer?.color || "#3B82F6" }} 
+                    className="w-5 h-5 rounded-full border-2 absolute -left-2.5 -top-2.5 animate-ping opacity-75"
+                  />
+                  {/* Solid inner cursor circle */}
+                  <div 
+                    style={{ 
+                      backgroundColor: partnerPlayer?.color || "#3B82F6",
+                      boxShadow: `0 0 8px ${partnerPlayer?.color || "#3B82F6"}`
+                    }}
+                    className="w-3.5 h-3.5 rounded-full border border-white relative"
+                  />
+                  {/* Floating Username Label above cursor */}
+                  <div 
+                    style={{ backgroundColor: partnerPlayer?.color || "#3B82F6" }}
+                    className="absolute left-4 top-0 -translate-y-1/2 px-1.5 py-0.5 rounded text-[10px] text-white font-bold whitespace-nowrap shadow-md select-none border border-white/20"
+                  >
+                    {partnerPlayer?.name || "Partner"}
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
         </div>
 
@@ -714,172 +1009,560 @@ export default function ColoringCanvas({
       <div className="w-full lg:w-80 bg-app-surface border border-app-border p-4 sm:p-5 rounded-3xl flex flex-col justify-between shrink-0 h-auto lg:h-full overflow-y-auto">
         
         {/* Core Controls */}
-        <div className="space-y-5 sm:space-y-6">
+        <div className="space-y-4">
           
-          {/* Tool selectors */}
-          <div>
-            <h3 className="text-xs font-bold uppercase tracking-wider text-app-text-muted mb-2.5">Choose Tool</h3>
-            <div className="grid grid-cols-4 gap-2">
+          {/* Always Visible Core Actions: Undo, Redo, Eraser Toggle */}
+          <div className="space-y-3">
+            <div className="grid grid-cols-3 gap-2">
+              <button
+                id="btn-undo-top"
+                onClick={handleUndo}
+                disabled={isFinishedLocal || !hasMyActions}
+                className="py-2 px-3 rounded-xl border border-app-border bg-app-bg text-app-text-muted hover:border-app-text-muted hover:text-app-text transition-all text-xs font-semibold flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed focus:outline-none focus:ring-2 focus:ring-app-primary/30 min-h-[40px]"
+                title="Undo last action"
+              >
+                <Undo2 className="w-3.5 h-3.5" />
+                <span className="text-[11px]">Undo</span>
+              </button>
+              
+              <button
+                id="btn-redo-top"
+                onClick={handleRedo}
+                disabled={isFinishedLocal || myRedoCount === 0}
+                className="py-2 px-3 rounded-xl border border-app-border bg-app-bg text-app-text-muted hover:border-app-text-muted hover:text-app-text transition-all text-xs font-semibold flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed focus:outline-none focus:ring-2 focus:ring-app-primary/30 min-h-[40px]"
+                title="Redo undone action"
+              >
+                <Redo2 className="w-3.5 h-3.5" />
+                <span className="text-[11px]">Redo</span>
+              </button>
+
+              <button
+                onClick={() => setActiveTool(prev => prev === "eraser" ? "brush" : "eraser")}
+                disabled={isFinishedLocal}
+                className={`py-2 px-3 rounded-xl border flex items-center justify-center gap-1.5 cursor-pointer transition-all focus:outline-none focus:ring-2 focus:ring-app-primary/50 min-h-[40px] ${
+                  activeTool === "eraser"
+                    ? "border-app-primary bg-app-primary/10 text-app-primary shadow-sm font-bold"
+                    : "border-app-border bg-app-bg text-app-text-muted hover:border-app-text-muted hover:text-app-text disabled:opacity-50"
+                }`}
+                title="Eraser Toggle"
+              >
+                <Eraser className="w-3.5 h-3.5" />
+                <span className="text-[11px]">Eraser</span>
+              </button>
+            </div>
+
+            {/* Quick Tool Selector Grid for other tools (Brush, Fill, Pan, Pick) */}
+            <div className="grid grid-cols-4 gap-1.5 border-t border-app-border/40 pt-2.5">
               <button
                 onClick={() => setActiveTool("brush")}
                 disabled={isFinishedLocal}
-                className={`p-2.5 sm:p-3 rounded-xl border flex flex-col items-center justify-center gap-1 cursor-pointer transition-all focus:outline-none focus:ring-2 focus:ring-app-primary/50 min-h-[44px] ${
+                className={`py-1.5 px-2 rounded-xl border flex flex-col items-center justify-center gap-1 cursor-pointer transition-all focus:outline-none focus:ring-2 focus:ring-app-primary/50 min-h-[42px] ${
                   activeTool === "brush"
-                    ? "border-app-primary bg-app-primary/10 text-app-primary shadow-md shadow-app-primary/5"
+                    ? "border-app-primary bg-app-primary/10 text-app-primary shadow-sm"
                     : "border-app-border bg-app-bg text-app-text-muted hover:border-app-text-muted hover:text-app-text disabled:opacity-50"
                 }`}
                 title="Paint Brush"
               >
-                <Paintbrush className="w-4.5 h-4.5 sm:w-5 sm:h-5" />
-                <span className="text-[10px] font-bold font-sans">Brush</span>
+                <Paintbrush className="w-3.5 h-3.5" />
+                <span className="text-[9px] font-bold font-sans">Brush</span>
               </button>
 
               <button
                 onClick={() => setActiveTool("bucket")}
                 disabled={isFinishedLocal}
-                className={`p-2.5 sm:p-3 rounded-xl border flex flex-col items-center justify-center gap-1 cursor-pointer transition-all focus:outline-none focus:ring-2 focus:ring-app-primary/50 min-h-[44px] ${
+                className={`py-1.5 px-2 rounded-xl border flex flex-col items-center justify-center gap-1 cursor-pointer transition-all focus:outline-none focus:ring-2 focus:ring-app-primary/50 min-h-[42px] ${
                   activeTool === "bucket"
-                    ? "border-app-primary bg-app-primary/10 text-app-primary shadow-md shadow-app-primary/5"
+                    ? "border-app-primary bg-app-primary/10 text-app-primary shadow-sm"
                     : "border-app-border bg-app-bg text-app-text-muted hover:border-app-text-muted hover:text-app-text disabled:opacity-50"
                 }`}
                 title="Bucket Fill"
               >
-                <PaintBucket className="w-4.5 h-4.5 sm:w-5 sm:h-5" />
-                <span className="text-[10px] font-bold font-sans">Fill</span>
-              </button>
-
-              <button
-                onClick={() => setActiveTool("eraser")}
-                disabled={isFinishedLocal}
-                className={`p-2.5 sm:p-3 rounded-xl border flex flex-col items-center justify-center gap-1 cursor-pointer transition-all focus:outline-none focus:ring-2 focus:ring-app-primary/50 min-h-[44px] ${
-                  activeTool === "eraser"
-                    ? "border-app-primary bg-app-primary/10 text-app-primary shadow-md shadow-app-primary/5"
-                    : "border-app-border bg-app-bg text-app-text-muted hover:border-app-text-muted hover:text-app-text disabled:opacity-50"
-                }`}
-                title="Eraser"
-              >
-                <Eraser className="w-4.5 h-4.5 sm:w-5 sm:h-5" />
-                <span className="text-[10px] font-bold font-sans">Eraser</span>
+                <PaintBucket className="w-3.5 h-3.5" />
+                <span className="text-[9px] font-bold font-sans">Fill</span>
               </button>
 
               <button
                 onClick={() => setActiveTool("pan")}
-                className={`p-2.5 sm:p-3 rounded-xl border flex flex-col items-center justify-center gap-1 cursor-pointer transition-all focus:outline-none focus:ring-2 focus:ring-app-primary/50 min-h-[44px] ${
+                className={`py-1.5 px-2 rounded-xl border flex flex-col items-center justify-center gap-1 cursor-pointer transition-all focus:outline-none focus:ring-2 focus:ring-app-primary/50 min-h-[42px] ${
                   activeTool === "pan"
-                    ? "border-app-primary bg-app-primary/10 text-app-primary shadow-md shadow-app-primary/5"
+                    ? "border-app-primary bg-app-primary/10 text-app-primary shadow-sm"
                     : "border-app-border bg-app-bg text-app-text-muted hover:border-app-text-muted hover:text-app-text"
                 }`}
                 title="Pan Canvas"
               >
-                <Hand className="w-4.5 h-4.5 sm:w-5 sm:h-5" />
-                <span className="text-[10px] font-bold font-sans">Pan</span>
+                <Hand className="w-3.5 h-3.5" />
+                <span className="text-[9px] font-bold font-sans">Pan</span>
+              </button>
+
+              <button
+                onClick={triggerNativeEyedropper}
+                disabled={isFinishedLocal}
+                className={`py-1.5 px-2 rounded-xl border flex flex-col items-center justify-center gap-1 cursor-pointer transition-all focus:outline-none focus:ring-2 focus:ring-app-primary/50 min-h-[42px] ${
+                  activeTool === "eyedropper"
+                    ? "border-app-primary bg-app-primary/10 text-app-primary shadow-sm"
+                    : "border-app-border bg-app-bg text-app-text-muted hover:border-app-text-muted hover:text-app-text disabled:opacity-50"
+                }`}
+                title="Eyedropper"
+              >
+                <Pipette className="w-3.5 h-3.5" />
+                <span className="text-[9px] font-bold font-sans">Pick</span>
               </button>
             </div>
           </div>
 
-          {/* Color Presets */}
-          <div>
-            <div className="flex justify-between items-center mb-2.5">
-              <h3 className="text-xs font-bold uppercase tracking-wider text-app-text-muted font-sans">Palette</h3>
-              
-              {/* Custom hex indicator/picker */}
-              <div className="flex items-center gap-1.5 bg-app-bg p-1 rounded-lg border border-app-border">
-                <input 
-                  type="color" 
-                  value={brushColor} 
-                  onChange={(e) => setBrushColor(e.target.value)}
-                  disabled={isFinishedLocal}
-                  className="w-5 h-5 border-0 rounded cursor-pointer bg-transparent disabled:opacity-50"
-                />
-                <span className="text-[10px] font-mono font-bold text-app-text-muted uppercase pr-1">
+          {/* Current Color Indicator and Bookmark Action */}
+          <div className="flex items-center justify-between bg-app-bg p-2 rounded-xl border border-app-border/60">
+            <div className="flex items-center gap-2">
+              <div 
+                style={{ backgroundColor: brushColor }} 
+                className="w-7 h-7 rounded-lg border border-app-border/80 shadow-sm shrink-0"
+              />
+              <div className="flex flex-col">
+                <span className="text-[10px] font-bold text-app-text uppercase font-mono">
                   {brushColor}
+                </span>
+                <span className="text-[8px] text-app-text-muted font-sans font-medium uppercase tracking-wider">
+                  Current Color
                 </span>
               </div>
             </div>
-
-            <div className="grid grid-cols-4 gap-2">
-              {PALETTE.map((color) => {
-                const isSel = brushColor.toLowerCase() === color.toLowerCase() && activeTool !== "eraser";
-                return (
-                  <button
-                    key={color}
-                    onClick={() => {
-                      setBrushColor(color);
-                      if (activeTool === "eraser" || activeTool === "pan") {
-                        setActiveTool("brush");
-                      }
-                    }}
-                    disabled={isFinishedLocal}
-                    style={{ backgroundColor: color }}
-                    className={`h-9 w-full rounded-xl cursor-pointer transition-all relative focus:outline-none focus:ring-2 focus:ring-app-primary/50 min-h-[36px] ${
-                      isSel 
-                        ? "scale-105 ring-2 ring-app-primary ring-offset-2 ring-offset-app-bg" 
-                        : "hover:scale-102"
-                    } disabled:opacity-50`}
-                  />
-                );
-              })}
+            
+            <div className="flex items-center gap-1.5">
+              <button
+                onClick={() => toggleFavoriteColor(brushColor)}
+                disabled={isFinishedLocal}
+                className="p-1.5 rounded-lg border border-app-border bg-app-bg text-app-text-muted hover:text-pink-500 hover:border-pink-500/30 transition-all cursor-pointer"
+                title="Favorite active color"
+              >
+                <Heart className={`w-3.5 h-3.5 ${favoriteColors.some(c => c.toLowerCase() === brushColor.toLowerCase()) ? "fill-pink-500 text-pink-500" : ""}`} />
+              </button>
+              
+              <button
+                onClick={() => toggleAccordion("colorLibrary")}
+                className={`p-1.5 rounded-lg border transition-all cursor-pointer ${
+                  activeAccordion === "colorLibrary"
+                    ? "border-app-primary bg-app-primary/10 text-app-primary"
+                    : "border-app-border bg-app-bg text-app-text-muted hover:text-app-text"
+                }`}
+                title="Open Color Library"
+              >
+                <Palette className="w-3.5 h-3.5" />
+              </button>
             </div>
           </div>
 
-          {/* Brush Size Slider */}
-          {(activeTool === "brush" || activeTool === "eraser") && (
-            <div className="space-y-3 animate-fade-in">
-              <div className="flex justify-between items-center">
-                <h3 className="text-xs font-bold uppercase tracking-wider text-app-text-muted font-sans">Brush Size</h3>
-                <span className="text-xs font-mono font-bold text-app-primary">{brushSize}px</span>
+          {/* Always Visible Brush Controls: Brush Type and Brush Size */}
+          <div className="space-y-3 bg-app-bg/10 p-2.5 rounded-2xl border border-app-border/30">
+            {/* Brush Type Button Group */}
+            <div className="space-y-1">
+              <span className="text-[10px] font-bold uppercase text-app-text-muted block">Brush Type</span>
+              <div className="grid grid-cols-5 gap-1">
+                {["hard", "soft", "marker", "pencil", "airbrush"].map((type) => (
+                  <button
+                    key={type}
+                    onClick={() => handleBrushTypeChange(type)}
+                    className={`py-1 rounded-lg text-[9px] font-bold uppercase transition-all border ${
+                      brushType === type
+                        ? "bg-app-primary text-white border-app-primary shadow-sm"
+                        : "bg-app-bg text-app-text-muted border-app-border hover:border-app-text-muted hover:text-app-text"
+                    }`}
+                  >
+                    {type === "hard" ? "Round" : type === "soft" ? "Soft" : type === "marker" ? "Mark" : type === "pencil" ? "Pen" : "Spray"}
+                  </button>
+                ))}
               </div>
-              <input
-                type="range"
-                min="3"
-                max="40"
-                value={brushSize}
-                onChange={(e) => setBrushSize(parseInt(e.target.value))}
-                disabled={isFinishedLocal}
-                className="w-full accent-app-primary bg-app-bg h-2 rounded-lg cursor-pointer min-h-[32px]"
-              />
-              
-              {/* Size indicator ball */}
-              <div className="h-10 w-full rounded-xl bg-app-bg border border-app-border flex items-center justify-center">
-                <div 
-                  style={{ 
-                    width: `${brushSize}px`, 
-                    height: `${brushSize}px`,
-                    backgroundColor: activeTool === "eraser" ? "#ffffff" : brushColor 
-                  }} 
-                  className={`rounded-full shadow-inner ${activeTool === "eraser" ? "border border-app-text-muted border-dashed" : ""}`}
+            </div>
+
+            {/* Brush Size Slider (Slimmer) */}
+            <div className="space-y-1">
+              <div className="flex justify-between text-[10px] font-bold uppercase text-app-text-muted">
+                <span>Brush Size</span>
+                <span className="text-app-primary font-mono">{brushSize}px</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <input
+                  type="range"
+                  min="1"
+                  max="100"
+                  value={brushSize}
+                  onChange={(e) => setBrushSize(parseInt(e.target.value))}
+                  disabled={isFinishedLocal}
+                  className="w-full accent-app-primary bg-app-bg h-1 rounded-lg cursor-pointer min-h-[16px]"
                 />
               </div>
             </div>
-          )}
+          </div>
 
-          {/* Canvas Operations: Undo, Clear */}
-          <div className="grid grid-cols-2 gap-2.5 pt-4 border-t border-app-border">
-            <button
-              onClick={handleUndo}
-              disabled={isFinishedLocal}
-              className="py-2.5 px-3 rounded-xl border border-app-border bg-app-bg text-app-text-muted hover:border-app-text-muted hover:text-app-text transition-all text-xs font-semibold flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-40 focus:outline-none focus:ring-2 focus:ring-app-primary/30 min-h-[44px]"
+          {/* --- ACCORDION SECTIONS (Only one is open at a time; all collapsed by default) --- */}
+          
+          {/* SECTION 1: Brush Settings (Opacity, Softness, Live Preview) */}
+          <div className="border border-app-border/40 rounded-2xl overflow-hidden bg-app-bg/10">
+            <div
+              onClick={() => toggleAccordion("brushSettings")}
+              className="flex justify-between items-center p-2.5 cursor-pointer select-none hover:bg-app-bg/20 transition-all"
             >
-              <Undo2 className="w-3.5 h-3.5" />
-              Undo
-            </button>
+              <div className="flex items-center gap-2">
+                <Sliders className="w-3.5 h-3.5 text-app-primary" />
+                <span className="text-xs font-bold text-app-text uppercase tracking-wider font-sans">Brush Settings</span>
+              </div>
+              <div className="flex items-center gap-1.5">
+                {activeAccordion !== "brushSettings" && (
+                  <span className="text-[9px] font-mono text-app-text-muted">
+                    O:{brushOpacity}% • S:{brushSoftness}%
+                  </span>
+                )}
+                {activeAccordion === "brushSettings" ? <ChevronUp className="w-3.5 h-3.5 text-app-text-muted" /> : <ChevronDown className="w-3.5 h-3.5 text-app-text-muted" />}
+              </div>
+            </div>
+
+            {activeAccordion === "brushSettings" && (
+              <div className="p-3 border-t border-app-border/30 bg-app-bg/5 space-y-3.5 animate-fade-in">
+                {/* Opacity Slider */}
+                <div className="space-y-1">
+                  <div className="flex justify-between text-[10px] font-bold uppercase text-app-text-muted">
+                    <span>Opacity</span>
+                    <span className="text-app-primary font-mono">{brushOpacity}%</span>
+                  </div>
+                  <input
+                    type="range"
+                    min="1"
+                    max="100"
+                    value={brushOpacity}
+                    onChange={(e) => setBrushOpacity(parseInt(e.target.value))}
+                    disabled={isFinishedLocal}
+                    className="w-full accent-app-primary bg-app-bg h-1 rounded-lg cursor-pointer min-h-[20px]"
+                  />
+                </div>
+
+                {/* Softness Slider */}
+                <div className="space-y-1">
+                  <div className="flex justify-between text-[10px] font-bold uppercase text-app-text-muted">
+                    <span>Softness / Feather</span>
+                    <span className="text-app-primary font-mono">{brushSoftness}%</span>
+                  </div>
+                  <input
+                    type="range"
+                    min="0"
+                    max="100"
+                    value={brushSoftness}
+                    onChange={(e) => setBrushSoftness(parseInt(e.target.value))}
+                    disabled={isFinishedLocal}
+                    className="w-full accent-app-primary bg-app-bg h-1 rounded-lg cursor-pointer min-h-[20px]"
+                  />
+                </div>
+
+                {/* High Fidelity Live Circle Preview */}
+                <div className="space-y-1.5">
+                  <span className="text-[10px] font-bold uppercase text-app-text-muted block">Live Stroke Preview</span>
+                  <div 
+                    style={{ 
+                      backgroundImage: "conic-gradient(#f1f5f9 25%, #ffffff 0 50%, #f1f5f9 0 75%, #ffffff 0)", 
+                      backgroundSize: "12px 12px" 
+                    }}
+                    className="h-16 w-full rounded-xl border border-app-border flex items-center justify-center relative overflow-hidden"
+                  >
+                    <div 
+                      style={{ 
+                        width: `${Math.min(60, brushSize)}px`, 
+                        height: `${Math.min(60, brushSize)}px`,
+                        backgroundColor: activeTool === "eraser" ? "#ffffff" : brushColor,
+                        opacity: brushOpacity / 100,
+                        filter: brushSoftness > 0 ? `blur(${brushSoftness * 0.1}px)` : "none"
+                      }} 
+                      className={`rounded-full shadow-md ${activeTool === "eraser" ? "border border-app-text-muted border-dashed" : ""}`}
+                    />
+                    <span className="absolute bottom-1 right-2 text-[8px] font-mono text-app-text-muted/60">
+                      {brushSize}px • {brushOpacity}%
+                    </span>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* SECTION 2: Color Library (Searchable Palette Groups & Favorites) */}
+          <div className="border border-app-border/40 rounded-2xl overflow-hidden bg-app-bg/10">
+            <div
+              onClick={() => toggleAccordion("colorLibrary")}
+              className="flex justify-between items-center p-2.5 cursor-pointer select-none hover:bg-app-bg/20 transition-all"
+            >
+              <div className="flex items-center gap-2">
+                <Palette className="w-3.5 h-3.5 text-app-primary" />
+                <span className="text-xs font-bold text-app-text uppercase tracking-wider font-sans">Color Library</span>
+              </div>
+              <div className="flex items-center gap-1.5">
+                {activeAccordion !== "colorLibrary" && (
+                  <span className="text-[9px] font-bold bg-app-primary/15 text-app-primary px-1.5 py-0.5 rounded capitalize">
+                    {activePaletteGroup}
+                  </span>
+                )}
+                {activeAccordion === "colorLibrary" ? <ChevronUp className="w-3.5 h-3.5 text-app-text-muted" /> : <ChevronDown className="w-3.5 h-3.5 text-app-text-muted" />}
+              </div>
+            </div>
+
+            {activeAccordion === "colorLibrary" && (
+              <div className="p-3 border-t border-app-border/30 bg-app-bg/5 space-y-3.5 animate-fade-in">
+                
+                {/* Searchable Palette Dropdown Header */}
+                <div className="space-y-2">
+                  <div className="relative">
+                    <Search className="w-3.5 h-3.5 absolute left-2.5 top-2.5 text-app-text-muted" />
+                    <input
+                      type="text"
+                      placeholder="Search palette groups..."
+                      value={paletteSearchQuery}
+                      onChange={(e) => {
+                        const query = e.target.value;
+                        setPaletteSearchQuery(query);
+                        const matched = Object.keys(PRESET_PALETTES).filter(g => g.toLowerCase().includes(query.toLowerCase()));
+                        if (matched.length > 0 && !matched.includes(activePaletteGroup)) {
+                          setActivePaletteGroup(matched[0]);
+                        }
+                      }}
+                      className="w-full bg-app-bg text-[11px] pl-8 pr-2.5 py-1.5 rounded-lg border border-app-border outline-none focus:border-app-primary"
+                    />
+                  </div>
+
+                  {/* Filtered drop-down select list */}
+                  <select
+                    value={activePaletteGroup}
+                    onChange={(e) => setActivePaletteGroup(e.target.value)}
+                    className="w-full bg-app-bg text-app-text border border-app-border rounded-lg px-2 py-1.5 text-xs font-semibold focus:outline-none focus:ring-2 focus:ring-app-primary/50 cursor-pointer"
+                  >
+                    {Object.keys(PRESET_PALETTES)
+                      .filter(groupName => groupName.toLowerCase().includes(paletteSearchQuery.toLowerCase()))
+                      .map(groupName => (
+                        <option key={groupName} value={groupName}>
+                          {groupName}
+                        </option>
+                    ))}
+                    {Object.keys(PRESET_PALETTES).filter(groupName => groupName.toLowerCase().includes(paletteSearchQuery.toLowerCase())).length === 0 && (
+                      <option disabled>No matching palettes</option>
+                    )}
+                  </select>
+                </div>
+
+                {/* Colors Grid for selected Palette Group */}
+                <div className="grid grid-cols-5 gap-1">
+                  {(PRESET_PALETTES[activePaletteGroup] || []).map((color) => {
+                    const isSel = brushColor.toLowerCase() === color.toLowerCase() && activeTool !== "eraser";
+                    return (
+                      <button
+                        key={color}
+                        onClick={() => handleColorSelect(color)}
+                        disabled={isFinishedLocal}
+                        style={{ backgroundColor: color }}
+                        className={`h-7 w-full rounded-lg cursor-pointer transition-all relative focus:outline-none focus:ring-2 focus:ring-app-primary/50 min-h-[28px] ${
+                          isSel 
+                            ? "scale-108 ring-2 ring-app-primary ring-offset-1 ring-offset-app-bg" 
+                            : "hover:scale-103"
+                        } disabled:opacity-50`}
+                        title={color}
+                      />
+                    );
+                  })}
+                </div>
+
+                {/* Favorites Subsection */}
+                <div className="border-t border-app-border/30 pt-3 space-y-2">
+                  <div className="flex justify-between items-center">
+                    <span className="text-[10px] font-bold uppercase text-app-text-muted flex items-center gap-1">
+                      <Heart className="w-3 h-3 text-pink-500 fill-pink-500" />
+                      Bookmarks
+                    </span>
+                    <span className="text-[8px] bg-pink-500/10 text-pink-500 px-1 py-0.25 rounded font-bold">
+                      {favoriteColors.length} saved
+                    </span>
+                  </div>
+
+                  {favoriteColors.length === 0 ? (
+                    <p className="text-[9px] text-app-text-muted italic text-center py-1 bg-app-bg/25 rounded-lg">
+                      Heart a color to bookmark it here!
+                    </p>
+                  ) : (
+                    <div className="grid grid-cols-6 gap-1">
+                      {favoriteColors.map((color) => {
+                        const isSel = brushColor.toLowerCase() === color.toLowerCase() && activeTool !== "eraser";
+                        return (
+                          <button
+                            key={color}
+                            onClick={() => handleColorSelect(color)}
+                            disabled={isFinishedLocal}
+                            style={{ backgroundColor: color }}
+                            className={`h-6 w-full rounded-md cursor-pointer transition-all relative focus:outline-none focus:ring-2 focus:ring-pink-500/50 min-h-[24px] ${
+                              isSel 
+                                ? "scale-108 ring-2 ring-pink-500 ring-offset-1 ring-offset-app-bg" 
+                                : "hover:scale-103"
+                            } disabled:opacity-50`}
+                            title={color}
+                          />
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+
+              </div>
+            )}
+          </div>
+
+          {/* SECTION 3: Advanced Color Picker (HSV, RGB, HEX) */}
+          <div className="border border-app-border/40 rounded-2xl overflow-hidden bg-app-bg/10">
+            <div
+              onClick={() => toggleAccordion("advancedPicker")}
+              className="flex justify-between items-center p-2.5 cursor-pointer select-none hover:bg-app-bg/20 transition-all"
+            >
+              <div className="flex items-center gap-2">
+                <Sliders className="w-3.5 h-3.5 text-app-primary" />
+                <span className="text-xs font-bold text-app-text uppercase tracking-wider font-sans">Advanced Picker</span>
+              </div>
+              <ChevronDown className={`w-3.5 h-3.5 text-app-text-muted transition-transform ${activeAccordion === "advancedPicker" ? "rotate-180" : ""}`} />
+            </div>
+
+            {activeAccordion === "advancedPicker" && (
+              <div className="p-3 border-t border-app-border/30 bg-app-bg/5 space-y-3 animate-fade-in">
+                {/* Custom HSV Sliders */}
+                <div className="space-y-2.5">
+                  {/* Hue Slider */}
+                  <div className="space-y-1">
+                    <div className="flex justify-between text-[9px] font-bold uppercase text-app-text-muted">
+                      <span>Hue (H)</span>
+                      <span>{hexToHsv(brushColor).h}°</span>
+                    </div>
+                    <input
+                      type="range"
+                      min="0"
+                      max="360"
+                      value={hexToHsv(brushColor).h}
+                      onChange={(e) => handleHsvChange('h', parseInt(e.target.value))}
+                      disabled={isFinishedLocal}
+                      style={{
+                        background: "linear-gradient(to right, #ff0000, #ffff00, #00ff00, #00ffff, #0000ff, #ff00ff, #ff0000)"
+                      }}
+                      className="w-full h-2 rounded-lg cursor-pointer appearance-none outline-none accent-white min-h-[16px]"
+                    />
+                  </div>
+
+                  {/* Saturation Slider */}
+                  <div className="space-y-1">
+                    <div className="flex justify-between text-[9px] font-bold uppercase text-app-text-muted">
+                      <span>Saturation (S)</span>
+                      <span>{hexToHsv(brushColor).s}%</span>
+                    </div>
+                    <input
+                      type="range"
+                      min="0"
+                      max="100"
+                      value={hexToHsv(brushColor).s}
+                      onChange={(e) => handleHsvChange('s', parseInt(e.target.value))}
+                      disabled={isFinishedLocal}
+                      style={{
+                        background: `linear-gradient(to right, #ffffff, ${hsvToHex(hexToHsv(brushColor).h, 100, 100)})`
+                      }}
+                      className="w-full h-2 rounded-lg cursor-pointer appearance-none outline-none accent-white min-h-[16px]"
+                    />
+                  </div>
+
+                  {/* Value / Brightness Slider */}
+                  <div className="space-y-1">
+                    <div className="flex justify-between text-[9px] font-bold uppercase text-app-text-muted">
+                      <span>Value / Brightness (V)</span>
+                      <span>{hexToHsv(brushColor).v}%</span>
+                    </div>
+                    <input
+                      type="range"
+                      min="0"
+                      max="100"
+                      value={hexToHsv(brushColor).v}
+                      onChange={(e) => handleHsvChange('v', parseInt(e.target.value))}
+                      disabled={isFinishedLocal}
+                      style={{
+                        background: `linear-gradient(to right, #000000, ${hsvToHex(hexToHsv(brushColor).h, hexToHsv(brushColor).s, 100)})`
+                      }}
+                      className="w-full h-2 rounded-lg cursor-pointer appearance-none outline-none accent-white min-h-[16px]"
+                    />
+                  </div>
+                </div>
+
+                {/* Text input formats: HEX / RGB side-by-side */}
+                <div className="space-y-2 pt-2.5 border-t border-app-border/40">
+                  {/* HEX Input */}
+                  <div className="flex items-center gap-2">
+                    <span className="text-[10px] font-bold uppercase text-app-text-muted min-w-[28px]">HEX</span>
+                    <div className="flex-1 flex items-center gap-1 bg-app-bg p-1 rounded-lg border border-app-border focus-within:border-app-primary">
+                      <input 
+                        type="color" 
+                        value={brushColor} 
+                        onChange={(e) => handleColorSelect(e.target.value)}
+                        disabled={isFinishedLocal}
+                        className="w-5 h-5 border-0 rounded cursor-pointer bg-transparent shrink-0"
+                      />
+                      <input
+                        type="text"
+                        value={hexInputText}
+                        onChange={(e) => {
+                          setHexInputText(e.target.value);
+                          if (/^#[0-9A-F]{6}$/i.test(e.target.value)) {
+                            handleColorSelect(e.target.value);
+                          }
+                        }}
+                        disabled={isFinishedLocal}
+                        placeholder="#000000"
+                        className="w-full bg-transparent border-0 outline-none text-[11px] font-mono font-bold text-app-text uppercase select-text"
+                      />
+                    </div>
+                  </div>
+
+                  {/* Compact RGB Fields */}
+                  <div className="flex items-center gap-2">
+                    <span className="text-[10px] font-bold uppercase text-app-text-muted min-w-[28px]">RGB</span>
+                    <div className="flex-1 grid grid-cols-3 gap-1">
+                      {['r', 'g', 'b'].map((channel, idx) => {
+                        const rgbVal = idx === 0 ? hexToRgb(brushColor)[0] : idx === 1 ? hexToRgb(brushColor)[1] : hexToRgb(brushColor)[2];
+                        return (
+                          <div key={channel} className="flex items-center bg-app-bg px-1.5 py-0.5 rounded-lg border border-app-border">
+                            <span className="text-[8px] font-mono font-bold text-app-text-muted mr-1 capitalize">{channel}</span>
+                            <input
+                              type="number"
+                              min="0"
+                              max="255"
+                              value={rgbVal}
+                              onChange={(e) => handleRgbChange(channel, e.target.value)}
+                              disabled={isFinishedLocal}
+                              className="w-full bg-transparent border-0 outline-none text-[10px] font-mono text-center text-app-text font-bold"
+                            />
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </div>
+
+              </div>
+            )}
+          </div>
+
+          {/* Secondary Low-Profile Canvas Operations (Reset) */}
+          <div className="pt-2 border-t border-app-border/20">
             <button
+              id="btn-clear-changes"
               onClick={handleClear}
-              disabled={isFinishedLocal}
-              className="py-2.5 px-3 rounded-xl border border-red-500/10 bg-red-500/5 text-red-400 hover:bg-red-500/10 transition-all text-xs font-semibold flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-40 focus:outline-none focus:ring-2 focus:ring-red-500/30 min-h-[44px]"
+              disabled={isFinishedLocal || !hasMyActions}
+              className="w-full py-2 px-3 rounded-xl border border-red-500/10 bg-red-500/5 text-red-400 hover:bg-red-500/10 transition-all text-[11px] font-semibold flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed focus:outline-none"
             >
-              <RotateCcw className="w-3.5 h-3.5" />
-              Clear All
+              <RotateCcw className="w-3 h-3" />
+              Reset My Canvas Edits
             </button>
           </div>
+
         </div>
 
         {/* Bottom Submission Panel */}
-        <div className="pt-5 sm:pt-6 border-t border-app-border mt-5 sm:mt-6">
+        <div className="pt-4 border-t border-app-border mt-4">
           <button
             onClick={handleFinish}
             disabled={isFinishedLocal}
-            className={`w-full py-3.5 sm:py-4 rounded-xl font-bold transition-all shadow-lg flex items-center justify-center gap-2 cursor-pointer focus:outline-none focus:ring-2 focus:ring-app-primary/50 min-h-[48px] ${
+            className={`w-full py-3 sm:py-3.5 rounded-xl font-bold transition-all shadow-md flex items-center justify-center gap-2 cursor-pointer focus:outline-none focus:ring-2 focus:ring-app-primary/50 min-h-[44px] ${
               isFinishedLocal
                 ? "bg-app-surface text-app-text-muted border border-app-border cursor-not-allowed opacity-50"
                 : "bg-app-primary hover:bg-app-primary-hover text-white shadow-app-primary/15"
@@ -887,23 +1570,22 @@ export default function ColoringCanvas({
           >
             {isFinishedLocal ? (
               <>
-                <CheckCircle className="w-5 h-5 text-emerald-400 animate-pulse" />
+                <CheckCircle className="w-4.5 h-4.5 text-emerald-400 animate-pulse" />
                 Submitted! Waiting...
               </>
             ) : (
               <>
-                <CheckSquare className="w-5 h-5" />
+                <CheckSquare className="w-4.5 h-4.5" />
                 Finish Artwork
               </>
             )}
           </button>
           
-          <p className="text-[10px] text-app-text-muted text-center mt-3 leading-relaxed flex items-center justify-center gap-1">
-            <AlertCircle className="w-3 h-3 text-app-text-muted opacity-80" />
-            Both artists must finish to merge and reveal the final artwork.
+          <p className="text-[10px] text-app-text-muted text-center mt-2 leading-relaxed flex items-center justify-center gap-1">
+            <AlertCircle className="w-3 h-3 text-app-text-muted opacity-80 shrink-0" />
+            Both artists must finish to merge and reveal.
           </p>
         </div>
-
       </div>
     </div>
   );
