@@ -250,6 +250,17 @@ export default function ColoringCanvas({
   const [partnerStatus, setPartnerStatus] = useState("");
   const [isFinishedLocal, setIsFinishedLocal] = useState(false);
 
+  // Advanced Canvas Interaction variables
+  const workspaceRef = useRef(null);
+  const activePointersRef = useRef(new Map());
+  const initialPinchDistanceRef = useRef(0);
+  const initialPinchZoomRef = useRef(1);
+  const initialPinchMidpointRef = useRef({ x: 0, y: 0 });
+  const initialPanOffsetRef = useRef({ x: 0, y: 0 });
+  const isMultiTouchingRef = useRef(false);
+  const [isSpacePressed, setIsSpacePressed] = useState(false);
+  const [isRightClickPanning, setIsRightClickPanning] = useState(false);
+
   const paintCanvasRef = useRef(null); // Offline drawing canvas
   const outlineCanvasRef = useRef(null); // Outline reference canvas
   const visibleCanvasRef = useRef(null); // On-screen composite canvas
@@ -504,9 +515,165 @@ export default function ColoringCanvas({
     return { x, y };
   };
 
+  // Keep panOffset within bounds to prevent losing the canvas
+  const clampPanOffset = (x, y, currentZoom, workspaceRect) => {
+    if (!workspaceRect) return { x, y };
+    const visibleCanvas = visibleCanvasRef.current;
+    if (!visibleCanvas) return { x, y };
+
+    const canvasW = visibleCanvas.clientWidth || 650;
+    const canvasH = visibleCanvas.clientHeight || 650;
+
+    const scaledW = canvasW * currentZoom;
+    const scaledH = canvasH * currentZoom;
+
+    // Provide soft boundaries: at least 60px of the canvas must remain in view inside the workspace
+    const limitX = Math.max(100, workspaceRect.width / 2 + scaledW / 2 - 60);
+    const limitY = Math.max(100, workspaceRect.height / 2 + scaledH / 2 - 60);
+
+    return {
+      x: Math.min(limitX, Math.max(-limitX, x)),
+      y: Math.min(limitY, Math.max(-limitY, y))
+    };
+  };
+
+  // Listen for Spacebar for temporary Pan mode
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      if (e.code === "Space") {
+        if (document.activeElement?.tagName === "INPUT" || document.activeElement?.tagName === "TEXTAREA") {
+          return;
+        }
+        e.preventDefault();
+        setIsSpacePressed(true);
+      }
+    };
+
+    const handleKeyUp = (e) => {
+      if (e.code === "Space") {
+        setIsSpacePressed(false);
+      }
+    };
+
+    const handleBlur = () => {
+      setIsSpacePressed(false);
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("keyup", handleKeyUp);
+    window.addEventListener("blur", handleBlur);
+
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("keyup", handleKeyUp);
+      window.removeEventListener("blur", handleBlur);
+    };
+  }, []);
+
+  // Listen for Mouse Wheel Zoom and prevent touch scrolling over the canvas container
+  useEffect(() => {
+    const workspace = workspaceRef.current;
+    if (!workspace) return;
+
+    const handleWheel = (e) => {
+      e.preventDefault();
+      
+      const zoomIntensity = e.ctrlKey ? 0.04 : 0.08;
+      const factor = e.deltaY < 0 ? (1 + zoomIntensity) : (1 - zoomIntensity);
+
+      const clientX = e.clientX;
+      const clientY = e.clientY;
+
+      setZoom(currentZoom => {
+        const newZoom = Math.min(16.0, Math.max(0.1, currentZoom * factor));
+        
+        setPanOffset(currentPan => {
+          const workspaceRect = workspace.getBoundingClientRect();
+          const workspaceCenterX = workspaceRect.left + workspaceRect.width / 2;
+          const workspaceCenterY = workspaceRect.top + workspaceRect.height / 2;
+          const relativeX = clientX - workspaceCenterX;
+          const relativeY = clientY - workspaceCenterY;
+          
+          const f = 1 - newZoom / currentZoom;
+          const nextX = currentPan.x + (relativeX - currentPan.x) * f;
+          const nextY = currentPan.y + (relativeY - currentPan.y) * f;
+          
+          return clampPanOffset(nextX, nextY, newZoom, workspaceRect);
+        });
+
+        return newZoom;
+      });
+    };
+
+    // Explicitly prevent touchmove from moving the parent page or pull-to-refresh
+    const handleTouchMove = (e) => {
+      if (e.cancelable) {
+        e.preventDefault();
+      }
+    };
+
+    workspace.addEventListener("wheel", handleWheel, { passive: false });
+    workspace.addEventListener("touchmove", handleTouchMove, { passive: false });
+
+    return () => {
+      workspace.removeEventListener("wheel", handleWheel);
+      workspace.removeEventListener("touchmove", handleTouchMove);
+    };
+  }, [zoom]);
+
   // Pointer Down handler
   const handlePointerDown = (e) => {
-    // If eyedropper tool, pick color and return
+    // Acquire pointer capture to ensure we receive moves/up even when leaving window
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch (err) {}
+
+    // Store active pointer location
+    activePointersRef.current.set(e.pointerId, { clientX: e.clientX, clientY: e.clientY });
+
+    // 1. Two-finger Pinch gesture start
+    if (activePointersRef.current.size >= 2) {
+      isMultiTouchingRef.current = true;
+      
+      // Cancel active drawing stroke instantly to avoid messy touch-down lines
+      if (isDrawingRef.current) {
+        isDrawingRef.current = false;
+        currentStrokePointsRef.current = [];
+        rebuildCanvasFromHistory();
+      }
+
+      setIsPanning(true);
+
+      const pointers = Array.from(activePointersRef.current.values());
+      const p1 = pointers[0];
+      const p2 = pointers[1];
+      
+      const dist = Math.hypot(p1.clientX - p2.clientX, p1.clientY - p2.clientY);
+      initialPinchDistanceRef.current = dist || 1;
+      initialPinchZoomRef.current = zoom;
+      
+      const midX = (p1.clientX + p2.clientX) / 2;
+      const midY = (p1.clientY + p2.clientY) / 2;
+      initialPinchMidpointRef.current = { x: midX, y: midY };
+      initialPanOffsetRef.current = { ...panOffset };
+      return;
+    }
+
+    // 2. Space pan, Middle pan, Right click pan, or Active Pan tool
+    const isRightClick = e.button === 2;
+    const isMiddleClick = e.button === 1;
+    const isPanMode = activeTool === "pan" || isSpacePressed || isRightClick || isMiddleClick;
+
+    if (isPanMode) {
+      setIsPanning(true);
+      if (isRightClick) {
+        setIsRightClickPanning(true);
+      }
+      setPanStart({ x: e.clientX - panOffset.x, y: e.clientY - panOffset.y });
+      return;
+    }
+
+    // 3. Eyedropper Color Pick
     if (activeTool === "eyedropper") {
       const paintCanvas = paintCanvasRef.current;
       if (paintCanvas) {
@@ -527,15 +694,9 @@ export default function ColoringCanvas({
       return;
     }
 
-    // If pan tool or right click, pan instead of drawing
-    if (activeTool === "pan" || e.button === 1 || e.button === 2) {
-      setIsPanning(true);
-      setPanStart({ x: e.clientX - panOffset.x, y: e.clientY - panOffset.y });
-      return;
-    }
-
     if (isFinishedLocal) return;
 
+    // 4. Normal Draw Touch Down
     const { x, y } = getCanvasCoords(e);
 
     // Restrict drawing to own side in split mode
@@ -547,12 +708,10 @@ export default function ColoringCanvas({
       isDrawingRef.current = true;
       currentStrokePointsRef.current = [x, y];
 
-      // Draw single point locally
       const paintCanvas = paintCanvasRef.current;
       const pctx = paintCanvas.getContext("2d");
       
       pctx.save();
-      // Apply split region clipping locally
       if (isSplitMode) {
         pctx.beginPath();
         pctx.rect(myXMin, 0, myXMax - myXMin, height);
@@ -594,7 +753,6 @@ export default function ColoringCanvas({
       const octx = outlineCanvas.getContext("2d");
       const outlineImageData = octx.getImageData(0, 0, width, height);
 
-      // Perform local fill
       const result = floodFill(
         paintCanvas, 
         x, 
@@ -608,7 +766,6 @@ export default function ColoringCanvas({
       if (result) {
         redrawComposite();
 
-        // Emit Committed Action
         const actionId = `${playerId}-${Date.now()}-${localActionIdRef.current++}`;
         const newAction = {
           id: actionId,
@@ -617,7 +774,6 @@ export default function ColoringCanvas({
           y,
           color: brushColor
         };
-        // Add to local history instantly for consistency
         room.actions.push({ ...newAction, playerId });
 
         socket.emit("draw-action", {
@@ -630,12 +786,72 @@ export default function ColoringCanvas({
 
   // Pointer Move handler
   const handlePointerMove = (e) => {
-    // Track cursor moves and emit to partner
-    if (!isFinishedLocal && socket && room && !isPanning) {
+    if (activePointersRef.current.has(e.pointerId)) {
+      activePointersRef.current.set(e.pointerId, { clientX: e.clientX, clientY: e.clientY });
+    }
+
+    // 1. Two-finger pinch zooming & panning
+    if (activePointersRef.current.size >= 2) {
+      const pointers = Array.from(activePointersRef.current.values());
+      const p1 = pointers[0];
+      const p2 = pointers[1];
+      
+      const dist = Math.hypot(p1.clientX - p2.clientX, p1.clientY - p2.clientY);
+      const scaleFactor = dist / (initialPinchDistanceRef.current || 1);
+      const targetZoom = initialPinchZoomRef.current * scaleFactor;
+      const newZoom = Math.min(16.0, Math.max(0.1, targetZoom));
+
+      // Compute gesture center midpoint
+      const midX = (p1.clientX + p2.clientX) / 2;
+      const midY = (p1.clientY + p2.clientY) / 2;
+
+      const workspace = workspaceRef.current;
+      if (workspace) {
+        const workspaceRect = workspace.getBoundingClientRect();
+        const workspaceCenterX = workspaceRect.left + workspaceRect.width / 2;
+        const workspaceCenterY = workspaceRect.top + workspaceRect.height / 2;
+        
+        // Offset relative to center of workspace
+        const relativeX = initialPinchMidpointRef.current.x - workspaceCenterX;
+        const relativeY = initialPinchMidpointRef.current.y - workspaceCenterY;
+        const f = 1 - newZoom / initialPinchZoomRef.current;
+        
+        const zoomPanX = initialPanOffsetRef.current.x + (relativeX - initialPanOffsetRef.current.x) * f;
+        const zoomPanY = initialPanOffsetRef.current.y + (relativeY - initialPanOffsetRef.current.y) * f;
+
+        // Midpoint translation displacement
+        const translationX = midX - initialPinchMidpointRef.current.x;
+        const translationY = midY - initialPinchMidpointRef.current.y;
+
+        const nextX = zoomPanX + translationX;
+        const nextY = zoomPanY + translationY;
+
+        setPanOffset(clampPanOffset(nextX, nextY, newZoom, workspaceRect));
+      }
+
+      setZoom(newZoom);
+      return;
+    }
+
+    // 2. Drag Panning
+    if (isPanning) {
+      const nextX = e.clientX - panStart.x;
+      const nextY = e.clientY - panStart.y;
+      
+      const workspace = workspaceRef.current;
+      if (workspace) {
+        const workspaceRect = workspace.getBoundingClientRect();
+        setPanOffset(clampPanOffset(nextX, nextY, zoom, workspaceRect));
+      }
+      return;
+    }
+
+    // 3. Emit cursor moves to remote players
+    if (!isFinishedLocal && socket && room && activePointersRef.current.size === 1 && !isMultiTouchingRef.current) {
       const { x, y } = getCanvasCoords(e);
       if (x >= 0 && x <= width && y >= 0 && y <= height) {
         const now = Date.now();
-        if (now - lastCursorEmitRef.current > 40) { // Throttle to ~25 FPS
+        if (now - lastCursorEmitRef.current > 40) {
           socket.emit("cursor-move", {
             roomCode: room.roomCode,
             x,
@@ -644,24 +860,15 @@ export default function ColoringCanvas({
           lastCursorEmitRef.current = now;
         }
       } else {
-        // Left the canvas boundaries, emit leave
         socket.emit("cursor-leave", { roomCode: room.roomCode });
       }
     }
 
-    if (isPanning) {
-      setPanOffset({
-        x: e.clientX - panStart.x,
-        y: e.clientY - panStart.y
-      });
-      return;
-    }
-
-    if (!isDrawingRef.current || isFinishedLocal) return;
+    // 4. Normal Drawing Pointer Move
+    if (!isDrawingRef.current || isFinishedLocal || activePointersRef.current.size !== 1 || isMultiTouchingRef.current) return;
 
     const { x, y } = getCanvasCoords(e);
 
-    // Bound drawing within our half in Split Mode
     let boundX = x;
     if (isSplitMode) {
       if (isP1) {
@@ -677,12 +884,10 @@ export default function ColoringCanvas({
 
     points.push(boundX, y);
 
-    // Draw locally
     const paintCanvas = paintCanvasRef.current;
     const pctx = paintCanvas.getContext("2d");
 
     pctx.save();
-    // Clip locally in split mode
     if (isSplitMode) {
       pctx.beginPath();
       pctx.rect(myXMin, 0, myXMax - myXMin, height);
@@ -702,7 +907,6 @@ export default function ColoringCanvas({
     pctx.restore();
     redrawComposite();
 
-    // Broadcast segment live
     socket.emit("paint-live", {
       roomCode: room.roomCode,
       playerId,
@@ -719,16 +923,26 @@ export default function ColoringCanvas({
   };
 
   // Pointer Up handler
-  const handlePointerUp = () => {
-    if (isPanning) {
+  const handlePointerUp = (e) => {
+    try {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    } catch (err) {}
+
+    activePointersRef.current.delete(e.pointerId);
+
+    // End panning or handle multi-touch release transitions
+    if (activePointersRef.current.size === 0) {
+      isMultiTouchingRef.current = false;
       setIsPanning(false);
-      return;
+      setIsRightClickPanning(false);
+    } else if (activePointersRef.current.size === 1) {
+      const remainingPointer = Array.from(activePointersRef.current.values())[0];
+      setPanStart({ x: remainingPointer.clientX - panOffset.x, y: remainingPointer.clientY - panOffset.y });
     }
 
     if (!isDrawingRef.current) return;
     isDrawingRef.current = false;
 
-    // Commit full stroke action
     if (currentStrokePointsRef.current.length >= 2) {
       const actionId = `${playerId}-${Date.now()}-${localActionIdRef.current++}`;
       const newAction = {
@@ -742,7 +956,6 @@ export default function ColoringCanvas({
         softness: activeTool === "eraser" ? 0 : brushSoftness
       };
 
-      // Add locally for instant sync
       room.actions.push({ ...newAction, playerId });
 
       socket.emit("draw-action", {
@@ -755,10 +968,19 @@ export default function ColoringCanvas({
   };
 
   // Pointer Leave handler
-  const handlePointerLeave = () => {
-    handlePointerUp(); // Complete drawing if drawing
-    if (!isFinishedLocal && socket && room) {
-      socket.emit("cursor-leave", { roomCode: room.roomCode });
+  const handlePointerLeave = (e) => {
+    activePointersRef.current.delete(e.pointerId);
+    if (activePointersRef.current.size === 0) {
+      isMultiTouchingRef.current = false;
+      setIsRightClickPanning(false);
+      
+      if (isDrawingRef.current) {
+        handlePointerUp(e);
+      }
+      
+      if (!isFinishedLocal && socket && room) {
+        socket.emit("cursor-leave", { roomCode: room.roomCode });
+      }
     }
   };
 
@@ -784,7 +1006,24 @@ export default function ColoringCanvas({
 
   // Zoom Operations
   const handleZoom = (factor) => {
-    setZoom(prev => Math.min(4.0, Math.max(0.6, prev * factor)));
+    setZoom(currentZoom => {
+      const newZoom = Math.min(16.0, Math.max(0.1, currentZoom * factor));
+      // Centered on workspace center
+      const workspace = workspaceRef.current;
+      if (workspace) {
+        const workspaceRect = workspace.getBoundingClientRect();
+        const relativeX = 0;
+        const relativeY = 0;
+        const f = 1 - newZoom / currentZoom;
+        
+        setPanOffset(currentPan => {
+          const nextX = currentPan.x + (relativeX - currentPan.x) * f;
+          const nextY = currentPan.y + (relativeY - currentPan.y) * f;
+          return clampPanOffset(nextX, nextY, newZoom, workspaceRect);
+        });
+      }
+      return newZoom;
+    });
   };
 
   const resetPanAndZoom = () => {
@@ -839,7 +1078,13 @@ export default function ColoringCanvas({
 
         {/* Outer Workspace Grid/Pan board */}
         <div 
-          className="absolute inset-0 cursor-crosshair overflow-hidden flex items-center justify-center"
+          ref={workspaceRef}
+          className={`absolute inset-0 overflow-hidden flex items-center justify-center ${
+            activeTool === "pan" || isSpacePressed || isRightClickPanning
+              ? (isPanning ? "cursor-grabbing" : "cursor-grab")
+              : "cursor-crosshair"
+          }`}
+          style={{ touchAction: "none" }}
           onPointerDown={handlePointerDown}
           onPointerMove={handlePointerMove}
           onPointerUp={handlePointerUp}
@@ -972,6 +1217,11 @@ export default function ColoringCanvas({
           >
             <ZoomIn className="w-4 h-4" />
           </button>
+
+          <div className="text-[10px] font-bold text-app-text-muted font-mono text-center select-none py-0.5 border-t border-b border-app-border/40 my-0.5">
+            {Math.round(zoom * 100)}%
+          </div>
+
           <button 
             onClick={() => handleZoom(0.8)} 
             className="p-2 text-app-text-muted hover:text-app-text rounded-lg hover:bg-app-surface-hover cursor-pointer transition-colors focus:outline-none min-w-[36px] min-h-[36px] flex items-center justify-center"
