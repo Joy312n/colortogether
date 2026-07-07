@@ -102,9 +102,6 @@ export default function App() {
     // Socket: Sync Success (handles refresh or reconnection)
     socket.on("sync-success", ({ roomCode, room: syncedRoom, playerId: sid }) => {
       setLoading(false);
-      if (syncedRoom && syncedRoom.actions) {
-        syncedRoom.actions.sort((a, b) => (a.sequenceNumber || 0) - (b.sequenceNumber || 0));
-      }
       setRoom(syncedRoom);
       setPlayerId(sid);
       localStorage.setItem("colortogether_room_code", roomCode);
@@ -157,9 +154,6 @@ export default function App() {
     // Socket: Room Created Successful
     socket.on("room-created", ({ roomCode, room: newRoom }) => {
       setLoading(false);
-      if (newRoom && newRoom.actions) {
-        newRoom.actions.sort((a, b) => (a.sequenceNumber || 0) - (b.sequenceNumber || 0));
-      }
       setRoom(newRoom);
       localStorage.setItem("colortogether_room_code", roomCode);
       setScreen("ROOM_LOBBY");
@@ -168,9 +162,6 @@ export default function App() {
     // Socket: Joined Success
     socket.on("join-success", ({ roomCode, room: joinedRoom, playerId: sid }) => {
       setLoading(false);
-      if (joinedRoom && joinedRoom.actions) {
-        joinedRoom.actions.sort((a, b) => (a.sequenceNumber || 0) - (b.sequenceNumber || 0));
-      }
       setRoom(joinedRoom);
       setPlayerId(sid);
       localStorage.setItem("colortogether_room_code", roomCode);
@@ -193,11 +184,9 @@ export default function App() {
     socket.on("room-updated", (updatedRoom) => {
       setRoom(prev => {
         if (!prev) return updatedRoom;
-        const sortedActions = [...(updatedRoom.actions || [])].sort((a, b) => (a.sequenceNumber || 0) - (b.sequenceNumber || 0));
         return {
           ...updatedRoom,
-          image: updatedRoom.image || prev.image,
-          actions: sortedActions
+          image: updatedRoom.image || prev.image
         };
       });
     });
@@ -206,11 +195,10 @@ export default function App() {
     socket.on("new-action", ({ action }) => {
       setRoom(prev => {
         if (!prev) return null;
-        if (prev.actions.some(a => (a.actionId || a.id) === (action.actionId || action.id))) return prev;
-        const sortedActions = [...prev.actions, action].sort((a, b) => (a.sequenceNumber || 0) - (b.sequenceNumber || 0));
+        if (prev.actions.some(a => a.id === action.id)) return prev;
         return {
           ...prev,
-          actions: sortedActions
+          actions: [...prev.actions, action]
         };
       });
     });
@@ -219,7 +207,7 @@ export default function App() {
     socket.on("undo-action", ({ playerId, actionId }) => {
       setRoom(prev => {
         if (!prev) return null;
-        const filtered = prev.actions.filter(a => a.id !== actionId && a.actionId !== actionId);
+        const filtered = prev.actions.filter(a => a.id !== actionId);
         
         const updatedRedoCounts = { ...(prev.redoCounts || {}) };
         updatedRedoCounts[playerId] = (updatedRedoCounts[playerId] || 0) + 1;
@@ -236,8 +224,8 @@ export default function App() {
     socket.on("redo-action", ({ playerId, action }) => {
       setRoom(prev => {
         if (!prev) return null;
-        if (prev.actions.some(a => (a.actionId || a.id) === (action.actionId || action.id))) return prev;
-        const sortedActions = [...prev.actions, action].sort((a, b) => (a.sequenceNumber || 0) - (b.sequenceNumber || 0));
+        if (prev.actions.some(a => a.id === action.id)) return prev;
+        const updatedActions = [...prev.actions, action].sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
 
         const updatedRedoCounts = { ...(prev.redoCounts || {}) };
         if (updatedRedoCounts[playerId]) {
@@ -246,7 +234,7 @@ export default function App() {
 
         return {
           ...prev,
-          actions: sortedActions,
+          actions: updatedActions,
           redoCounts: updatedRedoCounts
         };
       });
@@ -317,9 +305,6 @@ export default function App() {
     socket.on("session-restarted", (restartedRoom) => {
       setRoom(prev => {
         if (!prev) return restartedRoom;
-        if (restartedRoom && restartedRoom.actions) {
-          restartedRoom.actions.sort((a, b) => (a.sequenceNumber || 0) - (b.sequenceNumber || 0));
-        }
         return {
           ...restartedRoom,
           image: restartedRoom.image || prev.image
@@ -331,9 +316,6 @@ export default function App() {
     socket.on("session-started", (startedRoom) => {
       setRoom(prev => {
         if (!prev) return startedRoom;
-        if (startedRoom && startedRoom.actions) {
-          startedRoom.actions.sort((a, b) => (a.sequenceNumber || 0) - (b.sequenceNumber || 0));
-        }
         return {
           ...startedRoom,
           image: startedRoom.image || prev.image
