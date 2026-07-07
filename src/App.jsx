@@ -31,6 +31,22 @@ export default function App() {
 
   const socketRef = useRef(null);
 
+  const screenRef = useRef(screen);
+  const playerIdRef = useRef(playerId);
+  const nicknameRef = useRef(nickname);
+
+  useEffect(() => {
+    screenRef.current = screen;
+  }, [screen]);
+
+  useEffect(() => {
+    playerIdRef.current = playerId;
+  }, [playerId]);
+
+  useEffect(() => {
+    nicknameRef.current = nickname;
+  }, [nickname]);
+
   // Parse invite links or room codes from the URL
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -55,6 +71,7 @@ export default function App() {
     const socket = io(window.location.origin, {
       reconnectionAttempts: 15,
       reconnectionDelay: 2000,
+      transports: ["websocket"],
     });
 
     socketRef.current = socket;
@@ -65,8 +82,8 @@ export default function App() {
 
       // Attempt automatic session recovery/sync if we have saved details
       const savedRoomCode = localStorage.getItem("colortogether_room_code");
-      const savedPlayerId = localStorage.getItem("colortogether_player_id") || playerId;
-      const savedName = localStorage.getItem("colortogether_name") || nickname;
+      const savedPlayerId = localStorage.getItem("colortogether_player_id") || playerIdRef.current;
+      const savedName = localStorage.getItem("colortogether_name") || nicknameRef.current;
 
       if (savedRoomCode && savedPlayerId) {
         socket.emit("sync-session", {
@@ -102,7 +119,7 @@ export default function App() {
       localStorage.removeItem("colortogether_room_code");
       setRoom(null);
       // Only set error if we are actively in a game/room screen
-      if (screen !== "LOBBY") {
+      if (screenRef.current !== "LOBBY") {
         setError(errMsg);
         setScreen("LOBBY");
       }
@@ -316,7 +333,7 @@ export default function App() {
     return () => {
       socket.disconnect();
     };
-  }, [screen, playerId, nickname]);
+  }, []);
 
   // Action: Create Room
   const handleCreateRoom = ({ mode, image }) => {
