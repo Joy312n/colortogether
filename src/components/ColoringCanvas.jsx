@@ -984,6 +984,107 @@ export default function ColoringCanvas({
     }
   };
 
+  // Dedicated iOS Touch Event fallback mapping for WebKit to prevent scrolling, bouncing, zooming, and double-tap zoom
+  useEffect(() => {
+    const workspace = workspaceRef.current;
+    if (!workspace) return;
+
+    const isIOSWebKit = /iPad|iPhone|iPod/.test(navigator.userAgent) || 
+                        (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+
+    if (!isIOSWebKit) return;
+
+    const mapTouchToPointer = (touch, e, button = 0) => {
+      return {
+        pointerId: touch.identifier,
+        clientX: touch.clientX,
+        clientY: touch.clientY,
+        button: button,
+        buttons: 1,
+        pointerType: "touch",
+        currentTarget: workspace,
+        target: touch.target || workspace,
+        preventDefault: () => {
+          if (e.cancelable) {
+            e.preventDefault();
+          }
+        },
+      };
+    };
+
+    const handleTouchStart = (e) => {
+      if (e.cancelable) {
+        e.preventDefault();
+      }
+      for (let i = 0; i < e.changedTouches.length; i++) {
+        const touch = e.changedTouches[i];
+        handlePointerDown(mapTouchToPointer(touch, e, 0));
+      }
+    };
+
+    const handleTouchMove = (e) => {
+      if (e.cancelable) {
+        e.preventDefault();
+      }
+      for (let i = 0; i < e.changedTouches.length; i++) {
+        const touch = e.changedTouches[i];
+        handlePointerMove(mapTouchToPointer(touch, e, 0));
+      }
+    };
+
+    const handleTouchEnd = (e) => {
+      if (e.cancelable) {
+        e.preventDefault();
+      }
+      for (let i = 0; i < e.changedTouches.length; i++) {
+        const touch = e.changedTouches[i];
+        handlePointerUp(mapTouchToPointer(touch, e, 0));
+      }
+    };
+
+    const handleTouchCancel = (e) => {
+      if (e.cancelable) {
+        e.preventDefault();
+      }
+      for (let i = 0; i < e.changedTouches.length; i++) {
+        const touch = e.changedTouches[i];
+        handlePointerLeave(mapTouchToPointer(touch, e, 0));
+      }
+    };
+
+    workspace.addEventListener("touchstart", handleTouchStart, { passive: false });
+    workspace.addEventListener("touchmove", handleTouchMove, { passive: false });
+    workspace.addEventListener("touchend", handleTouchEnd, { passive: false });
+    workspace.addEventListener("touchcancel", handleTouchCancel, { passive: false });
+
+    return () => {
+      workspace.removeEventListener("touchstart", handleTouchStart);
+      workspace.removeEventListener("touchmove", handleTouchMove);
+      workspace.removeEventListener("touchend", handleTouchEnd);
+      workspace.removeEventListener("touchcancel", handleTouchCancel);
+    };
+  }, [
+    activeTool,
+    isSpacePressed,
+    isFinishedLocal,
+    brushColor,
+    brushSize,
+    brushType,
+    brushOpacity,
+    brushSoftness,
+    zoom,
+    panOffset,
+    isPanning,
+    panStart,
+    room,
+    playerId,
+    socket,
+    dimensions,
+    loadedImage,
+    isSplitMode,
+  ]);
+
+
   // Undo triggers
   const handleUndo = () => {
     if (isFinishedLocal) return;
@@ -1079,7 +1180,7 @@ export default function ColoringCanvas({
         {/* Outer Workspace Grid/Pan board */}
         <div 
           ref={workspaceRef}
-          className={`absolute inset-0 overflow-hidden flex items-center justify-center ${
+          className={`absolute inset-0 overflow-hidden flex items-center justify-center ios-canvas-container ${
             activeTool === "pan" || isSpacePressed || isRightClickPanning
               ? (isPanning ? "cursor-grabbing" : "cursor-grab")
               : "cursor-crosshair"
@@ -1105,7 +1206,7 @@ export default function ColoringCanvas({
               ref={visibleCanvasRef} 
               width={width} 
               height={height}
-              className="block select-none"
+              className="block select-none ios-canvas-container"
               style={
                 width >= height ? {
                   width: "min(70vh, 70vw, 650px)",

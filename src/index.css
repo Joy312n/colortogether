@@ -23,3 +23,14 @@ body, header, main, footer, button, input, select, textarea, div, span, p, h1, h
 canvas {
   transition: none !important;
 }
+
+/* iOS Canvas Interaction Prevention */
+.ios-canvas-container {
+  touch-action: none;
+  overscroll-behavior: none;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
