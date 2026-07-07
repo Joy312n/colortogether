@@ -261,6 +261,15 @@ export default function ColoringCanvas({
   const [isSpacePressed, setIsSpacePressed] = useState(false);
   const [isRightClickPanning, setIsRightClickPanning] = useState(false);
 
+  // iOS-specific Touch Gesture State Machine refs
+  const iosStateRef = useRef("IDLE"); // "IDLE" | "DRAWING" | "GESTURING"
+  const iosActiveTouchesRef = useRef(new Map()); // Key: touch.identifier -> { clientX, clientY }
+  const iosInitialDistanceRef = useRef(0);
+  const iosInitialZoomRef = useRef(1);
+  const iosInitialMidpointRef = useRef({ x: 0, y: 0 });
+  const iosInitialPanOffsetRef = useRef({ x: 0, y: 0 });
+  const iosNeedsResetRef = useRef(false);
+
   const paintCanvasRef = useRef(null); // Offline drawing canvas
   const outlineCanvasRef = useRef(null); // Outline reference canvas
   const visibleCanvasRef = useRef(null); // On-screen composite canvas
@@ -623,6 +632,12 @@ export default function ColoringCanvas({
 
   // Pointer Down handler
   const handlePointerDown = (e) => {
+    const isIOSWebKit = typeof navigator !== 'undefined' && (
+      /iPad|iPhone|iPod/.test(navigator.userAgent) || 
+      (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)
+    );
+    if (isIOSWebKit) return;
+
     // Acquire pointer capture to ensure we receive moves/up even when leaving window
     try {
       e.currentTarget.setPointerCapture(e.pointerId);
@@ -786,6 +801,12 @@ export default function ColoringCanvas({
 
   // Pointer Move handler
   const handlePointerMove = (e) => {
+    const isIOSWebKit = typeof navigator !== 'undefined' && (
+      /iPad|iPhone|iPod/.test(navigator.userAgent) || 
+      (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)
+    );
+    if (isIOSWebKit) return;
+
     if (activePointersRef.current.has(e.pointerId)) {
       activePointersRef.current.set(e.pointerId, { clientX: e.clientX, clientY: e.clientY });
     }
@@ -924,6 +945,12 @@ export default function ColoringCanvas({
 
   // Pointer Up handler
   const handlePointerUp = (e) => {
+    const isIOSWebKit = typeof navigator !== 'undefined' && (
+      /iPad|iPhone|iPod/.test(navigator.userAgent) || 
+      (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)
+    );
+    if (isIOSWebKit) return;
+
     try {
       e.currentTarget.releasePointerCapture(e.pointerId);
     } catch (err) {}
@@ -969,6 +996,12 @@ export default function ColoringCanvas({
 
   // Pointer Leave handler
   const handlePointerLeave = (e) => {
+    const isIOSWebKit = typeof navigator !== 'undefined' && (
+      /iPad|iPhone|iPod/.test(navigator.userAgent) || 
+      (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)
+    );
+    if (isIOSWebKit) return;
+
     activePointersRef.current.delete(e.pointerId);
     if (activePointersRef.current.size === 0) {
       isMultiTouchingRef.current = false;
@@ -994,31 +1027,150 @@ export default function ColoringCanvas({
 
     if (!isIOSWebKit) return;
 
-    const mapTouchToPointer = (touch, e, button = 0) => {
-      return {
-        pointerId: touch.identifier,
-        clientX: touch.clientX,
-        clientY: touch.clientY,
-        button: button,
-        buttons: 1,
-        pointerType: "touch",
-        currentTarget: workspace,
-        target: touch.target || workspace,
-        preventDefault: () => {
-          if (e.cancelable) {
-            e.preventDefault();
-          }
-        },
-      };
-    };
-
     const handleTouchStart = (e) => {
       if (e.cancelable) {
         e.preventDefault();
       }
-      for (let i = 0; i < e.changedTouches.length; i++) {
-        const touch = e.changedTouches[i];
-        handlePointerDown(mapTouchToPointer(touch, e, 0));
+
+      // Update active touches
+      for (let i = 0; i < e.targetTouches.length; i++) {
+        const touch = e.targetTouches[i];
+        iosActiveTouchesRef.current.set(touch.identifier, { clientX: touch.clientX, clientY: touch.clientY });
+      }
+
+      const numFingers = e.targetTouches.length;
+
+      if (numFingers === 1) {
+        if (iosNeedsResetRef.current) {
+          return;
+        }
+
+        if (iosStateRef.current === "IDLE") {
+          iosStateRef.current = "DRAWING";
+
+          const touch = e.targetTouches[0];
+          const { x, y } = getCanvasCoords({ clientX: touch.clientX, clientY: touch.clientY });
+
+          if (!isFinishedLocal) {
+            if (activeTool === "eyedropper") {
+              const paintCanvas = paintCanvasRef.current;
+              if (paintCanvas) {
+                const pctx = paintCanvas.getContext("2d");
+                try {
+                  const pixel = pctx.getImageData(x, y, 1, 1).data;
+                  if (pixel[3] > 0) {
+                    const hex = rgbToHex(pixel[0], pixel[1], pixel[2]);
+                    handleColorSelect(hex);
+                  } else {
+                    handleColorSelect("#FFFFFF");
+                  }
+                } catch (err) {}
+              }
+            } else if (activeTool === "brush" || activeTool === "eraser") {
+              isDrawingRef.current = true;
+              currentStrokePointsRef.current = [x, y];
+
+              const paintCanvas = paintCanvasRef.current;
+              const pctx = paintCanvas.getContext("2d");
+
+              pctx.save();
+              if (isSplitMode) {
+                pctx.beginPath();
+                pctx.rect(myXMin, 0, myXMax - myXMin, height);
+                pctx.clip();
+              }
+
+              drawBrushPoints(
+                pctx, 
+                [x, y, x, y], 
+                brushColor, 
+                brushSize, 
+                activeTool === "eraser",
+                brushType,
+                brushOpacity,
+                brushSoftness
+              );
+              pctx.restore();
+              redrawComposite();
+
+              socket.emit("paint-live", {
+                roomCode: room.roomCode,
+                playerId,
+                segment: {
+                  x0: x, y0: y, x1: x, y1: y,
+                  color: brushColor,
+                  size: brushSize,
+                  isEraser: activeTool === "eraser",
+                  brushType,
+                  opacity: brushOpacity,
+                  softness: brushSoftness
+                }
+              });
+            } else if (activeTool === "bucket") {
+              const paintCanvas = paintCanvasRef.current;
+              const outlineCanvas = outlineCanvasRef.current;
+              if (paintCanvas && outlineCanvas) {
+                const octx = outlineCanvas.getContext("2d");
+                const outlineImageData = octx.getImageData(0, 0, width, height);
+
+                const result = floodFill(
+                  paintCanvas, 
+                  x, 
+                  y, 
+                  hexToRgb(brushColor), 
+                  outlineImageData,
+                  myXMin,
+                  myXMax
+                );
+
+                if (result) {
+                  redrawComposite();
+
+                  const actionId = `${playerId}-${Date.now()}-${localActionIdRef.current++}`;
+                  const newAction = {
+                    id: actionId,
+                    type: "bucket",
+                    x,
+                    y,
+                    color: brushColor
+                  };
+                  room.actions.push({ ...newAction, playerId });
+
+                  socket.emit("draw-action", {
+                    roomCode: room.roomCode,
+                    action: newAction
+                  });
+                }
+              }
+            }
+          }
+        }
+      } else if (numFingers >= 2) {
+        // Multi-touch gestures started. Stop drawing!
+        if (iosStateRef.current === "DRAWING") {
+          if (isDrawingRef.current) {
+            isDrawingRef.current = false;
+            currentStrokePointsRef.current = [];
+            rebuildCanvasFromHistory();
+          }
+        }
+
+        iosStateRef.current = "GESTURING";
+        iosNeedsResetRef.current = true;
+
+        setIsPanning(true);
+
+        const touch1 = e.targetTouches[0];
+        const touch2 = e.targetTouches[1];
+
+        const dist = Math.hypot(touch1.clientX - touch2.clientX, touch1.clientY - touch2.clientY);
+        iosInitialDistanceRef.current = dist || 1;
+        iosInitialZoomRef.current = zoom;
+
+        const midX = (touch1.clientX + touch2.clientX) / 2;
+        const midY = (touch1.clientY + touch2.clientY) / 2;
+        iosInitialMidpointRef.current = { x: midX, y: midY };
+        iosInitialPanOffsetRef.current = { ...panOffset };
       }
     };
 
@@ -1026,9 +1178,121 @@ export default function ColoringCanvas({
       if (e.cancelable) {
         e.preventDefault();
       }
-      for (let i = 0; i < e.changedTouches.length; i++) {
-        const touch = e.changedTouches[i];
-        handlePointerMove(mapTouchToPointer(touch, e, 0));
+
+      // Update active touches
+      for (let i = 0; i < e.targetTouches.length; i++) {
+        const touch = e.targetTouches[i];
+        iosActiveTouchesRef.current.set(touch.identifier, { clientX: touch.clientX, clientY: touch.clientY });
+      }
+
+      if (iosStateRef.current === "DRAWING") {
+        if (!isDrawingRef.current || isFinishedLocal || e.targetTouches.length !== 1) return;
+
+        const touch = e.targetTouches[0];
+        const { x, y } = getCanvasCoords({ clientX: touch.clientX, clientY: touch.clientY });
+
+        let boundX = x;
+        if (isSplitMode) {
+          if (isP1) {
+            boundX = Math.min(width / 2 - 2, Math.max(0, x));
+          } else {
+            boundX = Math.min(width, Math.max(width / 2 + 2, x));
+          }
+        }
+
+        const points = currentStrokePointsRef.current;
+        if (points.length < 2) return;
+        const x0 = points[points.length - 2];
+        const y0 = points[points.length - 1];
+
+        points.push(boundX, y);
+
+        const paintCanvas = paintCanvasRef.current;
+        const pctx = paintCanvas.getContext("2d");
+
+        pctx.save();
+        if (isSplitMode) {
+          pctx.beginPath();
+          pctx.rect(myXMin, 0, myXMax - myXMin, height);
+          pctx.clip();
+        }
+
+        drawBrushPoints(
+          pctx, 
+          [x0, y0, boundX, y], 
+          brushColor, 
+          brushSize, 
+          activeTool === "eraser",
+          brushType,
+          brushOpacity,
+          brushSoftness
+        );
+        pctx.restore();
+        redrawComposite();
+
+        socket.emit("paint-live", {
+          roomCode: room.roomCode,
+          playerId,
+          segment: {
+            x0, y0, x1: boundX, y1: y,
+            color: brushColor,
+            size: brushSize,
+            isEraser: activeTool === "eraser",
+            brushType,
+            opacity: brushOpacity,
+            softness: brushSoftness
+          }
+        });
+
+        // Emit cursor moves
+        if (socket && room) {
+          const now = Date.now();
+          if (now - lastCursorEmitRef.current > 40) {
+            socket.emit("cursor-move", {
+              roomCode: room.roomCode,
+              x,
+              y
+            });
+            lastCursorEmitRef.current = now;
+          }
+        }
+      } else if (iosStateRef.current === "GESTURING") {
+        if (e.targetTouches.length < 2) return;
+
+        const touch1 = e.targetTouches[0];
+        const touch2 = e.targetTouches[1];
+
+        const dist = Math.hypot(touch1.clientX - touch2.clientX, touch1.clientY - touch2.clientY);
+        const scaleFactor = dist / (iosInitialDistanceRef.current || 1);
+        const targetZoom = iosInitialZoomRef.current * scaleFactor;
+        const newZoom = Math.min(16.0, Math.max(0.1, targetZoom));
+
+        const midX = (touch1.clientX + touch2.clientX) / 2;
+        const midY = (touch1.clientY + touch2.clientY) / 2;
+
+        const workspace = workspaceRef.current;
+        if (workspace) {
+          const workspaceRect = workspace.getBoundingClientRect();
+          const workspaceCenterX = workspaceRect.left + workspaceRect.width / 2;
+          const workspaceCenterY = workspaceRect.top + workspaceRect.height / 2;
+
+          const relativeX = iosInitialMidpointRef.current.x - workspaceCenterX;
+          const relativeY = iosInitialMidpointRef.current.y - workspaceCenterY;
+          const f = 1 - newZoom / iosInitialZoomRef.current;
+
+          const zoomPanX = iosInitialPanOffsetRef.current.x + (relativeX - iosInitialPanOffsetRef.current.x) * f;
+          const zoomPanY = iosInitialPanOffsetRef.current.y + (relativeY - iosInitialPanOffsetRef.current.y) * f;
+
+          const translationX = midX - iosInitialMidpointRef.current.x;
+          const translationY = midY - iosInitialMidpointRef.current.y;
+
+          const nextX = zoomPanX + translationX;
+          const nextY = zoomPanY + translationY;
+
+          setPanOffset(clampPanOffset(nextX, nextY, newZoom, workspaceRect));
+        }
+
+        setZoom(newZoom);
       }
     };
 
@@ -1036,9 +1300,51 @@ export default function ColoringCanvas({
       if (e.cancelable) {
         e.preventDefault();
       }
+
+      // Remove lifted touches from active touches
       for (let i = 0; i < e.changedTouches.length; i++) {
         const touch = e.changedTouches[i];
-        handlePointerUp(mapTouchToPointer(touch, e, 0));
+        iosActiveTouchesRef.current.delete(touch.identifier);
+      }
+
+      if (e.targetTouches.length === 0) {
+        if (iosStateRef.current === "DRAWING") {
+          if (isDrawingRef.current) {
+            isDrawingRef.current = false;
+            if (currentStrokePointsRef.current.length >= 2) {
+              const actionId = `${playerId}-${Date.now()}-${localActionIdRef.current++}`;
+              const newAction = {
+                id: actionId,
+                type: activeTool === "eraser" ? "eraser" : "brush",
+                points: [...currentStrokePointsRef.current],
+                color: activeTool === "eraser" ? null : brushColor,
+                size: brushSize,
+                brushType: activeTool === "eraser" ? "hard" : brushType,
+                opacity: activeTool === "eraser" ? 100 : brushOpacity,
+                softness: activeTool === "eraser" ? 0 : brushSoftness
+              };
+
+              room.actions.push({ ...newAction, playerId });
+
+              socket.emit("draw-action", {
+                roomCode: room.roomCode,
+                action: newAction
+              });
+            }
+            currentStrokePointsRef.current = [];
+          }
+        } else if (iosStateRef.current === "GESTURING") {
+          setIsPanning(false);
+        }
+
+        iosStateRef.current = "IDLE";
+        iosNeedsResetRef.current = false;
+      } else {
+        if (iosStateRef.current === "GESTURING") {
+          if (e.targetTouches.length < 2) {
+            setIsPanning(false);
+          }
+        }
       }
     };
 
@@ -1046,9 +1352,21 @@ export default function ColoringCanvas({
       if (e.cancelable) {
         e.preventDefault();
       }
+
       for (let i = 0; i < e.changedTouches.length; i++) {
         const touch = e.changedTouches[i];
-        handlePointerLeave(mapTouchToPointer(touch, e, 0));
+        iosActiveTouchesRef.current.delete(touch.identifier);
+      }
+
+      if (e.targetTouches.length === 0) {
+        if (iosStateRef.current === "DRAWING") {
+          isDrawingRef.current = false;
+          currentStrokePointsRef.current = [];
+        } else if (iosStateRef.current === "GESTURING") {
+          setIsPanning(false);
+        }
+        iosStateRef.current = "IDLE";
+        iosNeedsResetRef.current = false;
       }
     };
 
