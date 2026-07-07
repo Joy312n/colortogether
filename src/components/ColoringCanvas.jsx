@@ -369,8 +369,15 @@ export default function ColoringCanvas({
       // In split mode, don't show the other player's painting live
       if (isSplitMode) return;
 
+      // Handle immediate stroke-end signal from partner
+      if (data && data.isEnd) {
+        delete activeLiveStrokesRef.current[senderId];
+        redrawComposite();
+        return;
+      }
+
       const segments = data || (segment ? [segment] : []);
-      if (segments.length === 0) return;
+      if (segments.length === 0 || !Array.isArray(segments)) return;
 
       if (!activeLiveStrokesRef.current[senderId]) {
         const firstSeg = segments[0];
@@ -999,6 +1006,51 @@ export default function ColoringCanvas({
     });
   };
 
+  // Helper to end a drawing stroke cleanly and reset all temporary drawing data
+  const endStrokeCleanup = (shouldCommit = true) => {
+    if (isDrawingRef.current) {
+      isDrawingRef.current = false;
+
+      if (shouldCommit && currentStrokePointsRef.current.length >= 2) {
+        const simplified = simplifyPath(currentStrokePointsRef.current, 1.2);
+        const actionId = `${playerId}-${Date.now()}-${localActionIdRef.current++}`;
+        const newAction = {
+          id: actionId,
+          type: activeTool === "eraser" ? "eraser" : "brush",
+          points: simplified,
+          color: activeTool === "eraser" ? null : brushColor,
+          size: brushSize,
+          brushType: activeTool === "eraser" ? "hard" : brushType,
+          opacity: activeTool === "eraser" ? 100 : brushOpacity,
+          softness: activeTool === "eraser" ? 0 : brushSoftness
+        };
+
+        room.actions.push({ ...newAction, playerId });
+
+        socket.emit("draw-action", {
+          roomCode: room.roomCode,
+          action: newAction
+        });
+      }
+
+      // Notify remote players to immediately remove our active live stroke
+      if (socket && room) {
+        socket.emit("paint-live", {
+          roomCode: room.roomCode,
+          playerId,
+          data: { isEnd: true }
+        });
+      }
+    }
+
+    // Explicitly clear all temporary drawing information and reset drawing state
+    currentStrokePointsRef.current = [];
+    livePaintBufferRef.current = [];
+    delete activeLiveStrokesRef.current[playerId];
+
+    rebuildCanvasFromHistory();
+  };
+
   // Pointer Up handler
   const handlePointerUp = (e) => {
     const isIOSWebKit = typeof navigator !== 'undefined' && (
@@ -1011,6 +1063,7 @@ export default function ColoringCanvas({
       e.currentTarget.releasePointerCapture(e.pointerId);
     } catch (err) {}
 
+    // Clear active pointer ID and cached position data
     activePointersRef.current.delete(e.pointerId);
 
     // End panning or handle multi-touch release transitions
@@ -1023,34 +1076,30 @@ export default function ColoringCanvas({
       setPanStart({ x: remainingPointer.clientX - panOffset.x, y: remainingPointer.clientY - panOffset.y });
     }
 
-    if (!isDrawingRef.current) return;
-    isDrawingRef.current = false;
+    endStrokeCleanup(true);
+  };
 
-    if (currentStrokePointsRef.current.length >= 2) {
-      const simplified = simplifyPath(currentStrokePointsRef.current, 1.2);
-      const actionId = `${playerId}-${Date.now()}-${localActionIdRef.current++}`;
-      const newAction = {
-        id: actionId,
-        type: activeTool === "eraser" ? "eraser" : "brush",
-        points: simplified,
-        color: activeTool === "eraser" ? null : brushColor,
-        size: brushSize,
-        brushType: activeTool === "eraser" ? "hard" : brushType,
-        opacity: activeTool === "eraser" ? 100 : brushOpacity,
-        softness: activeTool === "eraser" ? 0 : brushSoftness
-      };
+  // Pointer Cancel handler
+  const handlePointerCancel = (e) => {
+    const isIOSWebKit = typeof navigator !== 'undefined' && (
+      /iPad|iPhone|iPod/.test(navigator.userAgent) || 
+      (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)
+    );
+    if (isIOSWebKit) return;
 
-      room.actions.push({ ...newAction, playerId });
+    try {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    } catch (err) {}
 
-      socket.emit("draw-action", {
-        roomCode: room.roomCode,
-        action: newAction
-      });
+    activePointersRef.current.delete(e.pointerId);
+
+    if (activePointersRef.current.size === 0) {
+      isMultiTouchingRef.current = false;
+      setIsPanning(false);
+      setIsRightClickPanning(false);
     }
 
-    currentStrokePointsRef.current = [];
-    delete activeLiveStrokesRef.current[playerId];
-    rebuildCanvasFromHistory();
+    endStrokeCleanup(false);
   };
 
   // Pointer Leave handler
@@ -1333,33 +1382,7 @@ export default function ColoringCanvas({
 
       if (e.targetTouches.length === 0) {
         if (iosStateRef.current === "DRAWING") {
-          if (isDrawingRef.current) {
-            isDrawingRef.current = false;
-            if (currentStrokePointsRef.current.length >= 2) {
-              const simplified = simplifyPath(currentStrokePointsRef.current, 1.2);
-              const actionId = `${playerId}-${Date.now()}-${localActionIdRef.current++}`;
-              const newAction = {
-                id: actionId,
-                type: activeTool === "eraser" ? "eraser" : "brush",
-                points: simplified,
-                color: activeTool === "eraser" ? null : brushColor,
-                size: brushSize,
-                brushType: activeTool === "eraser" ? "hard" : brushType,
-                opacity: activeTool === "eraser" ? 100 : brushOpacity,
-                softness: activeTool === "eraser" ? 0 : brushSoftness
-              };
-
-              room.actions.push({ ...newAction, playerId });
-
-              socket.emit("draw-action", {
-                roomCode: room.roomCode,
-                action: newAction
-              });
-            }
-            currentStrokePointsRef.current = [];
-            delete activeLiveStrokesRef.current[playerId];
-            rebuildCanvasFromHistory();
-          }
+          endStrokeCleanup(true);
         } else if (iosStateRef.current === "GESTURING") {
           setIsPanning(false);
         }
@@ -1387,10 +1410,7 @@ export default function ColoringCanvas({
 
       if (e.targetTouches.length === 0) {
         if (iosStateRef.current === "DRAWING") {
-          isDrawingRef.current = false;
-          currentStrokePointsRef.current = [];
-          delete activeLiveStrokesRef.current[playerId];
-          rebuildCanvasFromHistory();
+          endStrokeCleanup(false);
         } else if (iosStateRef.current === "GESTURING") {
           setIsPanning(false);
         }
@@ -1537,6 +1557,7 @@ export default function ColoringCanvas({
           onPointerDown={handlePointerDown}
           onPointerMove={handlePointerMove}
           onPointerUp={handlePointerUp}
+          onPointerCancel={handlePointerCancel}
           onPointerLeave={handlePointerLeave}
           onContextMenu={(e) => e.preventDefault()}
         >
