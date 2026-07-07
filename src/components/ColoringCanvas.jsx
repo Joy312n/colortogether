@@ -281,6 +281,11 @@ export default function ColoringCanvas({
   const lastCursorEmitRef = useRef(0); // For throttling cursor position emissions
   const [partnerCursor, setPartnerCursor] = useState(null); // { x, y, trail: [{x, y, id}] }
 
+  // New robust synchronization state references
+  const activeLiveStrokesRef = useRef(new Map());
+  const currentStrokeIdRef = useRef(null);
+  const currentActionIdRef = useRef(null);
+
   const [dimensions, setDimensions] = useState({ width: 800, height: 800 });
   const [loadedImage, setLoadedImage] = useState(null);
   const { width, height } = dimensions;
@@ -339,6 +344,24 @@ export default function ColoringCanvas({
       pctx.clearRect(0, 0, width, height);
     }
 
+    // CLEANUP activeLiveStrokes that are now finalized and present in room.actions
+    if (room?.actions) {
+      room.actions.forEach(action => {
+        const sId = action.strokeId;
+        const aId = action.actionId || action.id;
+        if (sId && activeLiveStrokesRef.current.has(sId)) {
+          activeLiveStrokesRef.current.delete(sId);
+        }
+        if (aId) {
+          activeLiveStrokesRef.current.forEach((stroke, k) => {
+            if (stroke.actionId === aId || stroke.strokeId === aId) {
+              activeLiveStrokesRef.current.delete(k);
+            }
+          });
+        }
+      });
+    }
+
     rebuildCanvasFromHistory();
   }, [loadedImage, width, height, room?.actions]);
 
@@ -365,6 +388,91 @@ export default function ColoringCanvas({
         drawBrushPoints(pctx, [x0, y0, x1, y1], color, size, isEraser, remoteBrushType, remoteOpacity, remoteSoftness);
       });
       redrawComposite();
+    };
+
+    // Remote stroke started
+    const handleRemoteStrokeStarted = ({ playerId: senderId, strokeId, actionId, tool, brushSettings, points, timestamp }) => {
+      if (senderId === playerId) return;
+      if (isSplitMode) return; // In split mode, don't show partner's live stroke
+
+      activeLiveStrokesRef.current.set(strokeId, {
+        strokeId,
+        actionId,
+        playerId: senderId,
+        tool,
+        type: tool,
+        points: [...points],
+        color: brushSettings?.color,
+        size: brushSettings?.size,
+        brushType: brushSettings?.brushType,
+        opacity: brushSettings?.opacity,
+        softness: brushSettings?.softness,
+        status: "STARTED"
+      });
+
+      rebuildCanvasFromHistory();
+    };
+
+    // Remote stroke updated
+    const handleRemoteStrokeUpdated = ({ playerId: senderId, strokeId, points }) => {
+      if (senderId === playerId) return;
+      if (isSplitMode) return;
+
+      const activeStroke = activeLiveStrokesRef.current.get(strokeId);
+      if (activeStroke) {
+        activeStroke.points.push(...points);
+        activeStroke.status = "DRAWING";
+
+        // Draw the new segment directly for performance
+        const p = activeStroke.points;
+        if (p.length >= 4) {
+          const x0 = p[p.length - 4];
+          const y0 = p[p.length - 3];
+          const x1 = p[p.length - 2];
+          const y1 = p[p.length - 1];
+
+          const paintCanvas = paintCanvasRef.current;
+          if (paintCanvas) {
+            const pctx = paintCanvas.getContext("2d");
+            pctx.save();
+            drawBrushPoints(
+              pctx,
+              [x0, y0, x1, y1],
+              activeStroke.color,
+              activeStroke.size,
+              activeStroke.tool === "eraser" || activeStroke.type === "eraser",
+              activeStroke.brushType,
+              activeStroke.opacity,
+              activeStroke.softness
+            );
+            pctx.restore();
+            redrawComposite();
+          }
+        }
+      }
+    };
+
+    // Remote stroke ended (finalized)
+    const handleRemoteStrokeEnded = ({ playerId: senderId, strokeId, action }) => {
+      activeLiveStrokesRef.current.delete(strokeId);
+      rebuildCanvasFromHistory();
+    };
+
+    // Cleanup active live strokes when a player disconnects
+    const handlePlayerDisconnected = (data) => {
+      const disconnectedId = typeof data === "object" ? data?.playerId : data;
+      if (!disconnectedId) return;
+
+      let changed = false;
+      activeLiveStrokesRef.current.forEach((stroke, sId) => {
+        if (stroke.playerId === disconnectedId) {
+          activeLiveStrokesRef.current.delete(sId);
+          changed = true;
+        }
+      });
+      if (changed) {
+        rebuildCanvasFromHistory();
+      }
     };
 
     // Receive Partner Finished status
@@ -403,37 +511,27 @@ export default function ColoringCanvas({
     };
 
     socket.on("paint-live-received", handleLivePaint);
+    socket.on("stroke-started", handleRemoteStrokeStarted);
+    socket.on("stroke-updated", handleRemoteStrokeUpdated);
+    socket.on("stroke-ended", handleRemoteStrokeEnded);
+    socket.on("player-disconnected", handlePlayerDisconnected);
+    socket.on("player-left", handlePlayerDisconnected);
     socket.on("player-finished", handlePartnerFinished);
     socket.on("cursor-moved", handleCursorMoved);
     socket.on("cursor-left", handleCursorLeft);
 
     return () => {
       socket.off("paint-live-received", handleLivePaint);
+      socket.off("stroke-started", handleRemoteStrokeStarted);
+      socket.off("stroke-updated", handleRemoteStrokeUpdated);
+      socket.off("stroke-ended", handleRemoteStrokeEnded);
+      socket.off("player-disconnected", handlePlayerDisconnected);
+      socket.off("player-left", handlePlayerDisconnected);
       socket.off("player-finished", handlePartnerFinished);
       socket.off("cursor-moved", handleCursorMoved);
       socket.off("cursor-left", handleCursorLeft);
     };
   }, [socket, playerId, room?.mode]);
-
-  // Periodic flusher for batched real-time paint segments (30 FPS)
-  useEffect(() => {
-    if (!socket || !room) return;
-
-    const intervalId = setInterval(() => {
-      const buffer = livePaintBufferRef.current;
-      if (buffer.length === 0) return;
-
-      socket.emit("paint-live", {
-        roomCode: room.roomCode,
-        playerId,
-        data: buffer
-      });
-
-      livePaintBufferRef.current = [];
-    }, 33); // ~30 FPS
-
-    return () => clearInterval(intervalId);
-  }, [socket, room, playerId]);
 
   // Ensure the composite canvas is redrawn when theme or mode changes
   useEffect(() => {
@@ -520,9 +618,9 @@ export default function ColoringCanvas({
 
     // Replay all actions
     relevantActions.forEach(action => {
-      if (action.type === "brush" || action.type === "eraser") {
-        drawBrushPoints(pctx, action.points, action.color, action.size, action.type === "eraser", action.brushType, action.opacity, action.softness);
-      } else if (action.type === "bucket") {
+      if (action.type === "brush" || action.type === "eraser" || action.tool === "brush" || action.tool === "eraser") {
+        drawBrushPoints(pctx, action.points, action.color, action.size, action.type === "eraser" || action.tool === "eraser", action.brushType, action.opacity, action.softness);
+      } else if (action.type === "bucket" || action.tool === "bucket") {
         floodFill(
           paintCanvas, 
           action.x, 
@@ -534,6 +632,24 @@ export default function ColoringCanvas({
         );
       }
     });
+
+    // Replay active live strokes (only in non-split mode since in split mode they draw on the other side)
+    if (!isSplitMode) {
+      activeLiveStrokesRef.current.forEach(stroke => {
+        if (stroke.points && stroke.points.length >= 2) {
+          drawBrushPoints(
+            pctx,
+            stroke.points,
+            stroke.color,
+            stroke.size,
+            stroke.type === "eraser" || stroke.tool === "eraser",
+            stroke.brushType,
+            stroke.opacity,
+            stroke.softness
+          );
+        }
+      });
+    }
 
     redrawComposite();
   };
@@ -747,7 +863,29 @@ export default function ColoringCanvas({
 
     if (activeTool === "brush" || activeTool === "eraser") {
       isDrawingRef.current = true;
+
+      const strokeId = `${playerId}-${Date.now()}-stroke-${Math.random().toString(36).substr(2, 9)}`;
+      const actionId = `${playerId}-${Date.now()}-action-${Math.random().toString(36).substr(2, 9)}`;
+
+      currentStrokeIdRef.current = strokeId;
+      currentActionIdRef.current = actionId;
       currentStrokePointsRef.current = [x, y];
+
+      // Add to activeLiveStrokesRef Map
+      activeLiveStrokesRef.current.set(strokeId, {
+        strokeId,
+        actionId,
+        playerId,
+        tool: activeTool,
+        type: activeTool,
+        points: [x, y],
+        color: activeTool === "eraser" ? null : brushColor,
+        size: brushSize,
+        brushType,
+        opacity: brushOpacity,
+        softness: brushSoftness,
+        status: "STARTED"
+      });
 
       const paintCanvas = paintCanvasRef.current;
       const pctx = paintCanvas.getContext("2d");
@@ -772,19 +910,22 @@ export default function ColoringCanvas({
       pctx.restore();
       redrawComposite();
 
-      // Emit live starting point
-      socket.emit("paint-live", {
+      // Emit stroke-start
+      socket.emit("stroke-start", {
         roomCode: room.roomCode,
         playerId,
-        segment: {
-          x0: x, y0: y, x1: x, y1: y,
-          color: brushColor,
+        strokeId,
+        actionId,
+        tool: activeTool,
+        brushSettings: {
+          color: activeTool === "eraser" ? null : brushColor,
           size: brushSize,
-          isEraser: activeTool === "eraser",
           brushType,
           opacity: brushOpacity,
           softness: brushSoftness
-        }
+        },
+        points: [x, y],
+        timestamp: Date.now()
       });
     } else if (activeTool === "bucket") {
       const paintCanvas = paintCanvasRef.current;
@@ -807,19 +948,19 @@ export default function ColoringCanvas({
       if (result) {
         redrawComposite();
 
-        const actionId = `${playerId}-${Date.now()}-${localActionIdRef.current++}`;
-        const newAction = {
-          id: actionId,
-          type: "bucket",
-          x,
-          y,
-          color: brushColor
-        };
-        room.actions.push({ ...newAction, playerId });
-
-        socket.emit("draw-action", {
+        const actionId = `${playerId}-${Date.now()}-action-${Math.random().toString(36).substr(2, 9)}`;
+        
+        socket.emit("stroke-end", {
           roomCode: room.roomCode,
-          action: newAction
+          playerId,
+          strokeId: actionId,
+          actionId,
+          tool: "bucket",
+          brushSettings: {
+            color: brushColor
+          },
+          points: [x, y],
+          timestamp: Date.now()
         });
       }
     }
@@ -926,10 +1067,28 @@ export default function ColoringCanvas({
     }
 
     const points = currentStrokePointsRef.current;
+    if (points.length < 2) return;
     const x0 = points[points.length - 2];
     const y0 = points[points.length - 1];
 
     points.push(boundX, y);
+
+    const strokeId = currentStrokeIdRef.current;
+    if (strokeId) {
+      const activeStroke = activeLiveStrokesRef.current.get(strokeId);
+      if (activeStroke) {
+        activeStroke.points = [...points];
+        activeStroke.status = "DRAWING";
+      }
+
+      // Emit stroke-update with the latest coordinates
+      socket.emit("stroke-update", {
+        roomCode: room.roomCode,
+        playerId,
+        strokeId,
+        points: [boundX, y]
+      });
+    }
 
     const paintCanvas = paintCanvasRef.current;
     const pctx = paintCanvas.getContext("2d");
@@ -953,16 +1112,6 @@ export default function ColoringCanvas({
     );
     pctx.restore();
     redrawComposite();
-
-    livePaintBufferRef.current.push({
-      x0, y0, x1: boundX, y1: y,
-      color: brushColor,
-      size: brushSize,
-      isEraser: activeTool === "eraser",
-      brushType,
-      opacity: brushOpacity,
-      softness: brushSoftness
-    });
   };
 
   // Pointer Up handler
@@ -992,28 +1141,33 @@ export default function ColoringCanvas({
     if (!isDrawingRef.current) return;
     isDrawingRef.current = false;
 
-    if (currentStrokePointsRef.current.length >= 2) {
+    const strokeId = currentStrokeIdRef.current;
+    const actionId = currentActionIdRef.current;
+
+    if (strokeId && actionId && currentStrokePointsRef.current.length >= 2) {
       const simplified = simplifyPath(currentStrokePointsRef.current, 1.2);
-      const actionId = `${playerId}-${Date.now()}-${localActionIdRef.current++}`;
-      const newAction = {
-        id: actionId,
-        type: activeTool === "eraser" ? "eraser" : "brush",
-        points: simplified,
-        color: activeTool === "eraser" ? null : brushColor,
-        size: brushSize,
-        brushType: activeTool === "eraser" ? "hard" : brushType,
-        opacity: activeTool === "eraser" ? 100 : brushOpacity,
-        softness: activeTool === "eraser" ? 0 : brushSoftness
-      };
 
-      room.actions.push({ ...newAction, playerId });
-
-      socket.emit("draw-action", {
+      // Emit stroke-end
+      socket.emit("stroke-end", {
         roomCode: room.roomCode,
-        action: newAction
+        playerId,
+        strokeId,
+        actionId,
+        tool: activeTool,
+        brushSettings: {
+          color: activeTool === "eraser" ? null : brushColor,
+          size: brushSize,
+          brushType: activeTool === "eraser" ? "hard" : brushType,
+          opacity: activeTool === "eraser" ? 100 : brushOpacity,
+          softness: activeTool === "eraser" ? 0 : brushSoftness
+        },
+        points: simplified,
+        timestamp: Date.now()
       });
     }
 
+    currentStrokeIdRef.current = null;
+    currentActionIdRef.current = null;
     currentStrokePointsRef.current = [];
   };
 
@@ -1091,7 +1245,29 @@ export default function ColoringCanvas({
               }
             } else if (activeTool === "brush" || activeTool === "eraser") {
               isDrawingRef.current = true;
+
+              const strokeId = `${playerId}-${Date.now()}-stroke-${Math.random().toString(36).substr(2, 9)}`;
+              const actionId = `${playerId}-${Date.now()}-action-${Math.random().toString(36).substr(2, 9)}`;
+
+              currentStrokeIdRef.current = strokeId;
+              currentActionIdRef.current = actionId;
               currentStrokePointsRef.current = [x, y];
+
+              // Add to activeLiveStrokesRef Map
+              activeLiveStrokesRef.current.set(strokeId, {
+                strokeId,
+                actionId,
+                playerId,
+                tool: activeTool,
+                type: activeTool,
+                points: [x, y],
+                color: activeTool === "eraser" ? null : brushColor,
+                size: brushSize,
+                brushType,
+                opacity: brushOpacity,
+                softness: brushSoftness,
+                status: "STARTED"
+              });
 
               const paintCanvas = paintCanvasRef.current;
               const pctx = paintCanvas.getContext("2d");
@@ -1116,14 +1292,22 @@ export default function ColoringCanvas({
               pctx.restore();
               redrawComposite();
 
-              livePaintBufferRef.current.push({
-                x0: x, y0: y, x1: x, y1: y,
-                color: brushColor,
-                size: brushSize,
-                isEraser: activeTool === "eraser",
-                brushType,
-                opacity: brushOpacity,
-                softness: brushSoftness
+              // Emit stroke-start
+              socket.emit("stroke-start", {
+                roomCode: room.roomCode,
+                playerId,
+                strokeId,
+                actionId,
+                tool: activeTool,
+                brushSettings: {
+                  color: activeTool === "eraser" ? null : brushColor,
+                  size: brushSize,
+                  brushType,
+                  opacity: brushOpacity,
+                  softness: brushSoftness
+                },
+                points: [x, y],
+                timestamp: Date.now()
               });
             } else if (activeTool === "bucket") {
               const paintCanvas = paintCanvasRef.current;
@@ -1145,19 +1329,19 @@ export default function ColoringCanvas({
                 if (result) {
                   redrawComposite();
 
-                  const actionId = `${playerId}-${Date.now()}-${localActionIdRef.current++}`;
-                  const newAction = {
-                    id: actionId,
-                    type: "bucket",
-                    x,
-                    y,
-                    color: brushColor
-                  };
-                  room.actions.push({ ...newAction, playerId });
-
-                  socket.emit("draw-action", {
+                  const actionId = `${playerId}-${Date.now()}-action-${Math.random().toString(36).substr(2, 9)}`;
+                  
+                  socket.emit("stroke-end", {
                     roomCode: room.roomCode,
-                    action: newAction
+                    playerId,
+                    strokeId: actionId,
+                    actionId,
+                    tool: "bucket",
+                    brushSettings: {
+                      color: brushColor
+                    },
+                    points: [x, y],
+                    timestamp: Date.now()
                   });
                 }
               }
@@ -1226,6 +1410,23 @@ export default function ColoringCanvas({
 
         points.push(boundX, y);
 
+        const strokeId = currentStrokeIdRef.current;
+        if (strokeId) {
+          const activeStroke = activeLiveStrokesRef.current.get(strokeId);
+          if (activeStroke) {
+            activeStroke.points = [...points];
+            activeStroke.status = "DRAWING";
+          }
+
+          // Emit stroke-update with the latest coordinates
+          socket.emit("stroke-update", {
+            roomCode: room.roomCode,
+            playerId,
+            strokeId,
+            points: [boundX, y]
+          });
+        }
+
         const paintCanvas = paintCanvasRef.current;
         const pctx = paintCanvas.getContext("2d");
 
@@ -1248,16 +1449,6 @@ export default function ColoringCanvas({
         );
         pctx.restore();
         redrawComposite();
-
-        livePaintBufferRef.current.push({
-          x0, y0, x1: boundX, y1: y,
-          color: brushColor,
-          size: brushSize,
-          isEraser: activeTool === "eraser",
-          brushType,
-          opacity: brushOpacity,
-          softness: brushSoftness
-        });
 
         // Emit cursor moves
         if (socket && room) {
@@ -1326,27 +1517,34 @@ export default function ColoringCanvas({
         if (iosStateRef.current === "DRAWING") {
           if (isDrawingRef.current) {
             isDrawingRef.current = false;
-            if (currentStrokePointsRef.current.length >= 2) {
+
+            const strokeId = currentStrokeIdRef.current;
+            const actionId = currentActionIdRef.current;
+
+            if (strokeId && actionId && currentStrokePointsRef.current.length >= 2) {
               const simplified = simplifyPath(currentStrokePointsRef.current, 1.2);
-              const actionId = `${playerId}-${Date.now()}-${localActionIdRef.current++}`;
-              const newAction = {
-                id: actionId,
-                type: activeTool === "eraser" ? "eraser" : "brush",
-                points: simplified,
-                color: activeTool === "eraser" ? null : brushColor,
-                size: brushSize,
-                brushType: activeTool === "eraser" ? "hard" : brushType,
-                opacity: activeTool === "eraser" ? 100 : brushOpacity,
-                softness: activeTool === "eraser" ? 0 : brushSoftness
-              };
 
-              room.actions.push({ ...newAction, playerId });
-
-              socket.emit("draw-action", {
+              // Emit stroke-end
+              socket.emit("stroke-end", {
                 roomCode: room.roomCode,
-                action: newAction
+                playerId,
+                strokeId,
+                actionId,
+                tool: activeTool,
+                brushSettings: {
+                  color: activeTool === "eraser" ? null : brushColor,
+                  size: brushSize,
+                  brushType: activeTool === "eraser" ? "hard" : brushType,
+                  opacity: activeTool === "eraser" ? 100 : brushOpacity,
+                  softness: activeTool === "eraser" ? 0 : brushSoftness
+                },
+                points: simplified,
+                timestamp: Date.now()
               });
             }
+
+            currentStrokeIdRef.current = null;
+            currentActionIdRef.current = null;
             currentStrokePointsRef.current = [];
           }
         } else if (iosStateRef.current === "GESTURING") {

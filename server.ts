@@ -17,14 +17,22 @@ interface Player {
 
 interface Action {
   id: string;
+  actionId?: string;
+  strokeId?: string;
   playerId: string;
   type: "brush" | "bucket" | "eraser";
+  tool?: string;
   points?: number[]; // [x1, y1, x2, y2, ...] flat coordinates
   x?: number;        // For bucket fill
   y?: number;        // For bucket fill
   color?: string;
   size?: number;
+  brushType?: string;
+  opacity?: number;
+  softness?: number;
   timestamp?: number; // Server-assigned order of actions
+  sequenceNumber?: number;
+  status?: string;
 }
 
 interface Room {
@@ -39,6 +47,64 @@ interface Room {
   hostTransferTimeout?: NodeJS.Timeout;
   undoStacks?: { [playerId: string]: Action[] };
   redoStacks?: { [playerId: string]: Action[] };
+  nextSequenceNumber?: number;
+  completedActionIds?: Set<string>;
+  completedStrokeIds?: Set<string>;
+}
+
+function addCompletedAction(room: Room, action: any, playerId: string): Action | null {
+  if (!room.nextSequenceNumber) {
+    room.nextSequenceNumber = 1;
+  }
+  if (!room.completedActionIds) {
+    room.completedActionIds = new Set<string>();
+  }
+  if (!room.completedStrokeIds) {
+    room.completedStrokeIds = new Set<string>();
+  }
+
+  const actionId = action.actionId || action.id;
+  const strokeId = action.strokeId;
+
+  // Validate duplicate actionId
+  if (actionId && room.completedActionIds.has(actionId)) {
+    console.log(`Rejected duplicate actionId: ${actionId}`);
+    return null;
+  }
+  // Validate duplicate strokeId
+  if (strokeId && room.completedStrokeIds.has(strokeId)) {
+    console.log(`Rejected duplicate strokeId: ${strokeId}`);
+    return null;
+  }
+
+  const sequenceNumber = room.nextSequenceNumber++;
+  const timestamp = action.timestamp || Date.now();
+
+  const finalizedAction: Action = {
+    ...action,
+    id: actionId,
+    actionId,
+    playerId,
+    timestamp,
+    sequenceNumber,
+    status: "FINISHED"
+  };
+
+  room.actions.push(finalizedAction);
+
+  if (actionId) room.completedActionIds.add(actionId);
+  if (strokeId) room.completedStrokeIds.add(strokeId);
+
+  // Store in undo stack
+  if (!room.undoStacks) room.undoStacks = {};
+  if (!room.undoStacks[playerId]) room.undoStacks[playerId] = [];
+  room.undoStacks[playerId].push(finalizedAction);
+
+  // Clear redo history
+  if (!room.redoStacks) room.redoStacks = {};
+  room.redoStacks[playerId] = [];
+
+  return finalizedAction;
 }
 
 async function startServer() {
@@ -363,38 +429,96 @@ async function startServer() {
       }
     });
 
-    // Handle New Action (Brush stroke, Bucket Fill, Eraser)
+    // Handle Stroke Start (Live continuous stroke initialization)
+    socket.on("stroke-start", ({ roomCode, strokeId, actionId, tool, brushSettings, points, timestamp }) => {
+      const code = (roomCode || socket.data.roomCode || "").toUpperCase();
+      const room = rooms.get(code);
+      if (!room) return;
+
+      const playerId = socket.data.playerId;
+      if (!playerId) return;
+
+      // Broadcast to other players in the room
+      socket.to(code).emit("stroke-started", {
+        playerId,
+        strokeId,
+        actionId,
+        tool,
+        brushSettings,
+        points,
+        timestamp: timestamp || Date.now()
+      });
+    });
+
+    // Handle Stroke Update (Live continuous stroke progression)
+    socket.on("stroke-update", ({ roomCode, strokeId, points }) => {
+      const code = (roomCode || socket.data.roomCode || "").toUpperCase();
+      if (!code) return;
+
+      const playerId = socket.data.playerId;
+      if (!playerId) return;
+
+      // Broadcast to other players in the room
+      socket.to(code).compress(false).emit("stroke-updated", {
+        playerId,
+        strokeId,
+        points
+      });
+    });
+
+    // Handle Stroke End (Finalizing a continuous stroke)
+    socket.on("stroke-end", ({ roomCode, strokeId, actionId, tool, brushSettings, points, timestamp }) => {
+      const code = (roomCode || socket.data.roomCode || "").toUpperCase();
+      const room = rooms.get(code);
+      if (!room) return;
+
+      const playerId = socket.data.playerId;
+      if (!playerId) return;
+
+      // Construct action object
+      const actionData = {
+        actionId,
+        id: actionId,
+        strokeId,
+        tool,
+        type: tool, // backward-compatibility
+        points,
+        color: brushSettings?.color,
+        size: brushSettings?.size,
+        brushType: brushSettings?.brushType,
+        opacity: brushSettings?.opacity,
+        softness: brushSettings?.softness,
+        timestamp: timestamp || Date.now()
+      };
+
+      const finalizedAction = addCompletedAction(room, actionData, playerId);
+      if (finalizedAction) {
+        // Broadcast finalized action to everyone in the room (including sender to confirm completion)
+        io.to(code).emit("stroke-ended", { playerId, strokeId, action: finalizedAction });
+        io.to(code).emit("new-action", { action: finalizedAction });
+      }
+    });
+
+    // Handle New Action (Brush stroke, Bucket Fill, Eraser - kept for compatibility)
     socket.on("draw-action", ({ roomCode, action }) => {
       const code = (roomCode || socket.data.roomCode || "").toUpperCase();
       const room = rooms.get(code);
-
       if (!room) return;
 
       const playerId = socket.data.playerId || action.playerId;
       if (!playerId) return;
 
-      // Add player ID to action for attribution, plus server timestamp to ensure ordering is preserved
-      const actionWithPlayer = { ...action, playerId, timestamp: Date.now() };
-      room.actions.push(actionWithPlayer);
-
-      // Store in undo stack
-      if (!room.undoStacks) room.undoStacks = {};
-      if (!room.undoStacks[playerId]) room.undoStacks[playerId] = [];
-      room.undoStacks[playerId].push(actionWithPlayer);
-
-      // Redo history clears when the player creates a new drawing action after an undo
-      if (!room.redoStacks) room.redoStacks = {};
-      room.redoStacks[playerId] = [];
-
-      // Broadcast lightweight action event to everyone else instead of room-updated
-      socket.to(code).emit("new-action", { action: actionWithPlayer });
+      const finalizedAction = addCompletedAction(room, action, playerId);
+      if (finalizedAction) {
+        io.to(code).emit("stroke-ended", { playerId, strokeId: action.strokeId, action: finalizedAction });
+        io.to(code).emit("new-action", { action: finalizedAction });
+      }
     });
 
     // Handle Undo Action
     socket.on("undo-action", ({ roomCode }) => {
       const code = (roomCode || socket.data.roomCode || "").toUpperCase();
       const room = rooms.get(code);
-
       if (!room) return;
 
       const playerId = socket.data.playerId;
@@ -423,6 +547,12 @@ async function startServer() {
         // Filter it from local undo stack as well
         room.undoStacks[playerId] = room.undoStacks[playerId].filter(act => act.id !== undoneAction!.id);
 
+        // Remove from completed IDs
+        const actionId = undoneAction.actionId || undoneAction.id;
+        const strokeId = undoneAction.strokeId;
+        if (actionId && room.completedActionIds) room.completedActionIds.delete(actionId);
+        if (strokeId && room.completedStrokeIds) room.completedStrokeIds.delete(strokeId);
+
         console.log(`Player ${playerId} performed UNDO. Redo count: ${room.redoStacks[playerId].length}`);
 
         // Broadcast lightweight undo event instead of room-updated
@@ -434,7 +564,6 @@ async function startServer() {
     socket.on("redo-action", ({ roomCode }) => {
       const code = (roomCode || socket.data.roomCode || "").toUpperCase();
       const room = rooms.get(code);
-
       if (!room) return;
 
       const playerId = socket.data.playerId;
@@ -448,15 +577,21 @@ async function startServer() {
 
       const redoneAction = room.redoStacks[playerId].pop();
       if (redoneAction) {
+        // Re-add to completed IDs
+        const actionId = redoneAction.actionId || redoneAction.id;
+        const strokeId = redoneAction.strokeId;
+        if (actionId && room.completedActionIds) room.completedActionIds.add(actionId);
+        if (strokeId && room.completedStrokeIds) room.completedStrokeIds.add(strokeId);
+
         // Push back to room.actions and to undo stack
         room.actions.push(redoneAction);
         room.undoStacks[playerId].push(redoneAction);
 
-        // Sort by timestamp to preserve action order
+        // Sort by sequenceNumber to preserve exact original layer order
         room.actions.sort((a, b) => {
-          const tA = a.timestamp || 0;
-          const tB = b.timestamp || 0;
-          return tA - tB;
+          const sA = a.sequenceNumber || 0;
+          const sB = b.sequenceNumber || 0;
+          return sA - sB;
         });
 
         console.log(`Player ${playerId} performed REDO. Redo count: ${room.redoStacks[playerId].length}`);
@@ -470,11 +605,21 @@ async function startServer() {
     socket.on("clear-canvas", ({ roomCode }) => {
       const code = (roomCode || socket.data.roomCode || "").toUpperCase();
       const room = rooms.get(code);
-
       if (!room) return;
 
       const playerId = socket.data.playerId;
       if (!playerId) return;
+
+      // Remove this player's completed actionIds and strokeIds
+      if (room.completedActionIds) {
+        room.actions.forEach(act => {
+          if (act.playerId === playerId) {
+            const actId = act.actionId || act.id;
+            if (actId) room.completedActionIds!.delete(actId);
+            if (act.strokeId) room.completedStrokeIds!.delete(act.strokeId);
+          }
+        });
+      }
 
       // Filter out all actions by this player
       room.actions = room.actions.filter(act => act.playerId !== playerId);
