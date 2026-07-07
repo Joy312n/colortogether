@@ -22,7 +22,7 @@ import {
   Palette,
   Search
 } from "lucide-react";
-import { drawBrushPoints, floodFill, hexToRgb } from "../utils/canvasHelpers";
+import { drawBrushPoints, floodFill, hexToRgb, simplifyPath } from "../utils/canvasHelpers";
 import { useTheme } from "./ThemeContext";
 
 // 12 Premium Designer Colors
@@ -276,6 +276,7 @@ export default function ColoringCanvas({
   const outlineImageRef = useRef(null); // Cached Image element for outlines
   const isDrawingRef = useRef(false);
   const currentStrokePointsRef = useRef([]); // [x1, y1, x2, y2, ...]
+  const livePaintBufferRef = useRef([]); // For batching paint-live segments
   const localActionIdRef = useRef(0); // For unique local action IDs
   const lastCursorEmitRef = useRef(0); // For throttling cursor position emissions
   const [partnerCursor, setPartnerCursor] = useState(null); // { x, y, trail: [{x, y, id}] }
@@ -346,7 +347,7 @@ export default function ColoringCanvas({
     if (!socket) return;
 
     // Receive live drawing segments (low latency brush motion)
-    const handleLivePaint = ({ playerId: senderId, segment }) => {
+    const handleLivePaint = ({ playerId: senderId, segment, data }) => {
       if (senderId === playerId) return;
       
       const paintCanvas = paintCanvasRef.current;
@@ -356,8 +357,13 @@ export default function ColoringCanvas({
       // In split mode, don't show the other player's painting live
       if (isSplitMode) return;
 
-      const { x0, y0, x1, y1, color, size, isEraser, brushType: remoteBrushType, opacity: remoteOpacity, softness: remoteSoftness } = segment;
-      drawBrushPoints(pctx, [x0, y0, x1, y1], color, size, isEraser, remoteBrushType, remoteOpacity, remoteSoftness);
+      const segments = data || (segment ? [segment] : []);
+      if (segments.length === 0) return;
+
+      segments.forEach(seg => {
+        const { x0, y0, x1, y1, color, size, isEraser, brushType: remoteBrushType, opacity: remoteOpacity, softness: remoteSoftness } = seg;
+        drawBrushPoints(pctx, [x0, y0, x1, y1], color, size, isEraser, remoteBrushType, remoteOpacity, remoteSoftness);
+      });
       redrawComposite();
     };
 
@@ -408,6 +414,26 @@ export default function ColoringCanvas({
       socket.off("cursor-left", handleCursorLeft);
     };
   }, [socket, playerId, room?.mode]);
+
+  // Periodic flusher for batched real-time paint segments (30 FPS)
+  useEffect(() => {
+    if (!socket || !room) return;
+
+    const intervalId = setInterval(() => {
+      const buffer = livePaintBufferRef.current;
+      if (buffer.length === 0) return;
+
+      socket.emit("paint-live", {
+        roomCode: room.roomCode,
+        playerId,
+        data: buffer
+      });
+
+      livePaintBufferRef.current = [];
+    }, 33); // ~30 FPS
+
+    return () => clearInterval(intervalId);
+  }, [socket, room, playerId]);
 
   // Ensure the composite canvas is redrawn when theme or mode changes
   useEffect(() => {
@@ -928,18 +954,14 @@ export default function ColoringCanvas({
     pctx.restore();
     redrawComposite();
 
-    socket.emit("paint-live", {
-      roomCode: room.roomCode,
-      playerId,
-      segment: {
-        x0, y0, x1: boundX, y1: y,
-        color: brushColor,
-        size: brushSize,
-        isEraser: activeTool === "eraser",
-        brushType,
-        opacity: brushOpacity,
-        softness: brushSoftness
-      }
+    livePaintBufferRef.current.push({
+      x0, y0, x1: boundX, y1: y,
+      color: brushColor,
+      size: brushSize,
+      isEraser: activeTool === "eraser",
+      brushType,
+      opacity: brushOpacity,
+      softness: brushSoftness
     });
   };
 
@@ -971,11 +993,12 @@ export default function ColoringCanvas({
     isDrawingRef.current = false;
 
     if (currentStrokePointsRef.current.length >= 2) {
+      const simplified = simplifyPath(currentStrokePointsRef.current, 1.2);
       const actionId = `${playerId}-${Date.now()}-${localActionIdRef.current++}`;
       const newAction = {
         id: actionId,
         type: activeTool === "eraser" ? "eraser" : "brush",
-        points: [...currentStrokePointsRef.current],
+        points: simplified,
         color: activeTool === "eraser" ? null : brushColor,
         size: brushSize,
         brushType: activeTool === "eraser" ? "hard" : brushType,
@@ -1093,18 +1116,14 @@ export default function ColoringCanvas({
               pctx.restore();
               redrawComposite();
 
-              socket.emit("paint-live", {
-                roomCode: room.roomCode,
-                playerId,
-                segment: {
-                  x0: x, y0: y, x1: x, y1: y,
-                  color: brushColor,
-                  size: brushSize,
-                  isEraser: activeTool === "eraser",
-                  brushType,
-                  opacity: brushOpacity,
-                  softness: brushSoftness
-                }
+              livePaintBufferRef.current.push({
+                x0: x, y0: y, x1: x, y1: y,
+                color: brushColor,
+                size: brushSize,
+                isEraser: activeTool === "eraser",
+                brushType,
+                opacity: brushOpacity,
+                softness: brushSoftness
               });
             } else if (activeTool === "bucket") {
               const paintCanvas = paintCanvasRef.current;
@@ -1230,18 +1249,14 @@ export default function ColoringCanvas({
         pctx.restore();
         redrawComposite();
 
-        socket.emit("paint-live", {
-          roomCode: room.roomCode,
-          playerId,
-          segment: {
-            x0, y0, x1: boundX, y1: y,
-            color: brushColor,
-            size: brushSize,
-            isEraser: activeTool === "eraser",
-            brushType,
-            opacity: brushOpacity,
-            softness: brushSoftness
-          }
+        livePaintBufferRef.current.push({
+          x0, y0, x1: boundX, y1: y,
+          color: brushColor,
+          size: brushSize,
+          isEraser: activeTool === "eraser",
+          brushType,
+          opacity: brushOpacity,
+          softness: brushSoftness
         });
 
         // Emit cursor moves
@@ -1312,11 +1327,12 @@ export default function ColoringCanvas({
           if (isDrawingRef.current) {
             isDrawingRef.current = false;
             if (currentStrokePointsRef.current.length >= 2) {
+              const simplified = simplifyPath(currentStrokePointsRef.current, 1.2);
               const actionId = `${playerId}-${Date.now()}-${localActionIdRef.current++}`;
               const newAction = {
                 id: actionId,
                 type: activeTool === "eraser" ? "eraser" : "brush",
-                points: [...currentStrokePointsRef.current],
+                points: simplified,
                 color: activeTool === "eraser" ? null : brushColor,
                 size: brushSize,
                 brushType: activeTool === "eraser" ? "hard" : brushType,

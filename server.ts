@@ -53,7 +53,7 @@ async function startServer() {
   const rooms = new Map<string, Room>();
 
   // Helper to serialize room for sending over socket
-  function serializeRoom(room: Room) {
+  function serializeRoom(room: Room, includeImage: boolean = false) {
     const redoCounts: { [playerId: string]: number } = {};
     if (room.redoStacks) {
       for (const [pId, stack] of Object.entries(room.redoStacks)) {
@@ -63,7 +63,7 @@ async function startServer() {
     return {
       roomCode: room.roomCode,
       mode: room.mode,
-      image: room.image,
+      ...(includeImage ? { image: room.image } : {}),
       players: room.players.map(p => ({
         id: p.id,
         name: p.name,
@@ -115,7 +115,8 @@ async function startServer() {
                 currentHost.isHost = false;
                 newHost.isHost = true;
                 room.hostId = newHost.id;
-                io.to(room.roomCode).emit("room-updated", serializeRoom(room));
+                io.to(room.roomCode).emit("host-changed", { hostId: newHost.id });
+                io.to(room.roomCode).emit("room-updated", serializeRoom(room, false));
               }
             }
           }, 10 * 60 * 1000); // 10 minutes
@@ -204,7 +205,7 @@ async function startServer() {
       
       socket.join(roomCode);
 
-      socket.emit("room-created", { roomCode, room: serializeRoom(newRoom) });
+      socket.emit("room-created", { roomCode, room: serializeRoom(newRoom, true) });
       console.log(`Room created: ${roomCode} by ${nickname} in ${mode} mode`);
     });
 
@@ -247,8 +248,9 @@ async function startServer() {
         socket.join(code);
         manageRoomTimeouts(room, io);
 
-        io.to(code).emit("room-updated", serializeRoom(room));
-        socket.emit("join-success", { roomCode: code, room: serializeRoom(room), playerId });
+        socket.to(code).emit("player-joined", { player: existingPlayer });
+        io.to(code).emit("room-updated", serializeRoom(room, false));
+        socket.emit("join-success", { roomCode: code, room: serializeRoom(room, true), playerId });
         console.log(`Player ${nickname} re-joined room: ${code}`);
         return;
       }
@@ -278,8 +280,9 @@ async function startServer() {
 
       manageRoomTimeouts(room, io);
 
-      io.to(code).emit("room-updated", serializeRoom(room));
-      socket.emit("join-success", { roomCode: code, room: serializeRoom(room), playerId });
+      socket.to(code).emit("player-joined", { player: newPlayer });
+      io.to(code).emit("room-updated", serializeRoom(room, false));
+      socket.emit("join-success", { roomCode: code, room: serializeRoom(room, true), playerId });
       console.log(`Player ${nickname} joined room: ${code}`);
     });
 
@@ -321,12 +324,13 @@ async function startServer() {
       console.log(`Player ${player.name} (${playerId}) synced successfully to room ${code}`);
 
       // Notify other players in the room
-      io.to(code).emit("room-updated", serializeRoom(room));
+      socket.to(code).emit("player-joined", { player });
+      io.to(code).emit("room-updated", serializeRoom(room, false));
 
       // Send successful sync confirmation directly to reconnecting player
       socket.emit("sync-success", { 
         roomCode: code, 
-        room: serializeRoom(room), 
+        room: serializeRoom(room, true), 
         playerId 
       });
 
@@ -354,7 +358,7 @@ async function startServer() {
       const playerId = socket.data.playerId;
       if (room.hostId === playerId) {
         room.sessionStarted = true;
-        io.to(code).emit("session-started", serializeRoom(room));
+        io.to(code).emit("session-started", serializeRoom(room, false));
         console.log(`Session started for room: ${code}`);
       }
     });
@@ -382,8 +386,8 @@ async function startServer() {
       if (!room.redoStacks) room.redoStacks = {};
       room.redoStacks[playerId] = [];
 
-      // Broadcast room update to synchronize everyone
-      io.to(code).emit("room-updated", serializeRoom(room));
+      // Broadcast lightweight action event to everyone else instead of room-updated
+      socket.to(code).emit("new-action", { action: actionWithPlayer });
     });
 
     // Handle Undo Action
@@ -421,8 +425,8 @@ async function startServer() {
 
         console.log(`Player ${playerId} performed UNDO. Redo count: ${room.redoStacks[playerId].length}`);
 
-        // Broadcast room update to synchronize everyone
-        io.to(code).emit("room-updated", serializeRoom(room));
+        // Broadcast lightweight undo event instead of room-updated
+        io.to(code).emit("undo-action", { playerId, actionId: undoneAction.id });
       }
     });
 
@@ -457,8 +461,8 @@ async function startServer() {
 
         console.log(`Player ${playerId} performed REDO. Redo count: ${room.redoStacks[playerId].length}`);
 
-        // Broadcast room update to synchronize everyone
-        io.to(code).emit("room-updated", serializeRoom(room));
+        // Broadcast lightweight redo event instead of room-updated
+        io.to(code).emit("redo-action", { playerId, action: redoneAction });
       }
     });
 
@@ -484,8 +488,16 @@ async function startServer() {
 
       console.log(`Player ${playerId} cleared their changes.`);
 
-      // Broadcast room update to synchronize everyone
-      io.to(code).emit("room-updated", serializeRoom(room));
+      // Broadcast lightweight clear actions event instead of room-updated
+      io.to(code).emit("clear-player-actions", { playerId });
+    });
+
+    // Handle Live Painting (batch segments)
+    socket.on("paint-live", ({ roomCode, playerId, data }) => {
+      const code = (roomCode || socket.data.roomCode || "").toUpperCase();
+      if (!code) return;
+      // Disable Socket.IO compression for high-frequency live drawing segments
+      socket.to(code).compress(false).emit("paint-live-received", { playerId, data });
     });
 
     // Handle Cursor Movement
@@ -493,7 +505,8 @@ async function startServer() {
       const code = (roomCode || socket.data.roomCode || "").toUpperCase();
       const playerId = socket.data.playerId;
       if (!playerId || !code) return;
-      socket.to(code).emit("cursor-moved", { playerId, x, y });
+      // Disable Socket.IO compression for high-frequency cursor updates
+      socket.to(code).compress(false).emit("cursor-moved", { playerId, x, y });
     });
 
     // Handle Cursor Leaving
@@ -501,7 +514,8 @@ async function startServer() {
       const code = (roomCode || socket.data.roomCode || "").toUpperCase();
       const playerId = socket.data.playerId;
       if (!playerId || !code) return;
-      socket.to(code).emit("cursor-left", { playerId });
+      // Disable Socket.IO compression for cursor leave control packet
+      socket.to(code).compress(false).emit("cursor-left", { playerId });
     });
 
     // Handle Finish Coloring
@@ -550,7 +564,7 @@ async function startServer() {
           p.finished = false;
           p.finishedData = null;
         });
-        io.to(code).emit("session-restarted", serializeRoom(room));
+        io.to(code).emit("session-restarted", serializeRoom(room, false));
         console.log(`Session restarted for room: ${code}`);
       }
     });
@@ -579,8 +593,8 @@ async function startServer() {
           room.hostId = room.players[0].id;
         }
 
-        io.to(code).emit("room-updated", serializeRoom(room));
-        io.to(code).emit("player-left", leavingPlayer.name);
+        io.to(code).emit("player-left", { playerId: leavingPlayer.id, name: leavingPlayer.name });
+        io.to(code).emit("room-updated", serializeRoom(room, false));
 
         manageRoomTimeouts(room, io);
       }
@@ -623,7 +637,8 @@ async function startServer() {
           player.connected = false;
           console.log(`Player ${player.name} temporarily disconnected from room: ${code}`);
 
-          io.to(code).emit("room-updated", serializeRoom(room));
+          io.to(code).emit("player-disconnected", { playerId: player.id });
+          io.to(code).emit("room-updated", serializeRoom(room, false));
 
           manageRoomTimeouts(room, io);
           break;

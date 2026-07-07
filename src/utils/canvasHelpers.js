@@ -210,3 +210,77 @@ export function hexToRgb(hex) {
     ? [parseInt(result[1], 16), parseInt(result[2], 16), parseInt(result[3], 16)]
     : [0, 0, 0];
 }
+
+function getSqSegDist(px, py, p1x, p1y, p2x, p2y) {
+  let x = p1x;
+  let y = p1y;
+  let dx = p2x - x;
+  let dy = p2y - y;
+
+  if (dx !== 0 || dy !== 0) {
+    let t = ((px - x) * dx + (py - y) * dy) / (dx * dx + dy * dy);
+    if (t > 1) {
+      x = p2x;
+      y = p2y;
+    } else if (t > 0) {
+      x += dx * t;
+      y += dy * t;
+    }
+  }
+
+  dx = px - x;
+  dy = py - y;
+
+  return dx * dx + dy * dy;
+}
+
+function simplifyDPStep(points, first, last, sqTolerance, simplified) {
+  let maxSqDist = sqTolerance;
+  let index = -1;
+
+  const p1x = points[first * 2];
+  const p1y = points[first * 2 + 1];
+  const p2x = points[last * 2];
+  const p2y = points[last * 2 + 1];
+
+  for (let i = first + 1; i < last; i++) {
+    const px = points[i * 2];
+    const py = points[i * 2 + 1];
+    const sqDist = getSqSegDist(px, py, p1x, p1y, p2x, p2y);
+
+    if (sqDist > maxSqDist) {
+      index = i;
+      maxSqDist = sqDist;
+    }
+  }
+
+  if (maxSqDist > sqTolerance) {
+    if (index - first > 1) simplifyDPStep(points, first, index, sqTolerance, simplified);
+    simplified[index] = true;
+    if (last - index > 1) simplifyDPStep(points, index, last, sqTolerance, simplified);
+  }
+}
+
+/**
+ * Simplifies a 2D line using the Ramer-Douglas-Peucker algorithm.
+ * Expects a flat array of coordinates [x1, y1, x2, y2, ...]
+ */
+export function simplifyPath(points, epsilon = 1.0) {
+  const len = points.length / 2;
+  if (len <= 2) return points;
+
+  const sqTolerance = epsilon * epsilon;
+  const simplified = new Array(len).fill(false);
+  simplified[0] = true;
+  simplified[len - 1] = true;
+
+  simplifyDPStep(points, 0, len - 1, sqTolerance, simplified);
+
+  const result = [];
+  for (let i = 0; i < len; i++) {
+    if (simplified[i]) {
+      result.push(points[i * 2], points[i * 2 + 1]);
+    }
+  }
+  return result;
+}

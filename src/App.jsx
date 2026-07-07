@@ -119,8 +119,19 @@ export default function App() {
     });
 
     // Socket: Partner left the room
-    socket.on("player-left", (partnerName) => {
-      setError(`Your creative partner (${partnerName}) has left the room.`);
+    socket.on("player-left", (data) => {
+      const name = typeof data === "string" ? data : (data?.name || "Partner");
+      const leavingId = typeof data === "object" ? data?.playerId : null;
+      setError(`Your creative partner (${name}) has left the room.`);
+      if (leavingId) {
+        setRoom(prev => {
+          if (!prev) return null;
+          return {
+            ...prev,
+            players: prev.players.filter(p => p.id !== leavingId)
+          };
+        });
+      }
     });
 
     // Socket: Room Created Successful
@@ -154,12 +165,145 @@ export default function App() {
 
     // Socket: Lobby state updated
     socket.on("room-updated", (updatedRoom) => {
-      setRoom(updatedRoom);
+      setRoom(prev => {
+        if (!prev) return updatedRoom;
+        return {
+          ...updatedRoom,
+          image: updatedRoom.image || prev.image
+        };
+      });
+    });
+
+    // Socket: New draw action appended
+    socket.on("new-action", ({ action }) => {
+      setRoom(prev => {
+        if (!prev) return null;
+        if (prev.actions.some(a => a.id === action.id)) return prev;
+        return {
+          ...prev,
+          actions: [...prev.actions, action]
+        };
+      });
+    });
+
+    // Socket: Undo action performed
+    socket.on("undo-action", ({ playerId, actionId }) => {
+      setRoom(prev => {
+        if (!prev) return null;
+        const filtered = prev.actions.filter(a => a.id !== actionId);
+        
+        const updatedRedoCounts = { ...(prev.redoCounts || {}) };
+        updatedRedoCounts[playerId] = (updatedRedoCounts[playerId] || 0) + 1;
+
+        return {
+          ...prev,
+          actions: filtered,
+          redoCounts: updatedRedoCounts
+        };
+      });
+    });
+
+    // Socket: Redo action performed
+    socket.on("redo-action", ({ playerId, action }) => {
+      setRoom(prev => {
+        if (!prev) return null;
+        if (prev.actions.some(a => a.id === action.id)) return prev;
+        const updatedActions = [...prev.actions, action].sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+
+        const updatedRedoCounts = { ...(prev.redoCounts || {}) };
+        if (updatedRedoCounts[playerId]) {
+          updatedRedoCounts[playerId] = Math.max(0, updatedRedoCounts[playerId] - 1);
+        }
+
+        return {
+          ...prev,
+          actions: updatedActions,
+          redoCounts: updatedRedoCounts
+        };
+      });
+    });
+
+    // Socket: Personal actions cleared
+    socket.on("clear-player-actions", ({ playerId }) => {
+      setRoom(prev => {
+        if (!prev) return null;
+        
+        const updatedRedoCounts = { ...(prev.redoCounts || {}) };
+        updatedRedoCounts[playerId] = 0;
+
+        return {
+          ...prev,
+          actions: prev.actions.filter(a => a.playerId !== playerId),
+          redoCounts: updatedRedoCounts
+        };
+      });
+    });
+
+    // Socket: Player joined/connected
+    socket.on("player-joined", ({ player }) => {
+      setRoom(prev => {
+        if (!prev) return null;
+        const existingIndex = prev.players.findIndex(p => p.id === player.id);
+        let updatedPlayers;
+        if (existingIndex !== -1) {
+          updatedPlayers = [...prev.players];
+          updatedPlayers[existingIndex] = { ...updatedPlayers[existingIndex], ...player };
+        } else {
+          updatedPlayers = [...prev.players, player];
+        }
+        return {
+          ...prev,
+          players: updatedPlayers
+        };
+      });
+    });
+
+    // Socket: Player temporarily disconnected
+    socket.on("player-disconnected", ({ playerId }) => {
+      setRoom(prev => {
+        if (!prev) return null;
+        return {
+          ...prev,
+          players: prev.players.map(p => p.id === playerId ? { ...p, connected: false } : p)
+        };
+      });
+    });
+
+    // Socket: Host changed
+    socket.on("host-changed", ({ hostId }) => {
+      setRoom(prev => {
+        if (!prev) return null;
+        return {
+          ...prev,
+          hostId,
+          players: prev.players.map(p => ({
+            ...p,
+            isHost: p.id === hostId
+          }))
+        };
+      });
+    });
+
+    // Socket: Session restarted
+    socket.on("session-restarted", (restartedRoom) => {
+      setRoom(prev => {
+        if (!prev) return restartedRoom;
+        return {
+          ...restartedRoom,
+          image: restartedRoom.image || prev.image
+        };
+      });
     });
 
     // Socket: Game Session Started
     socket.on("session-started", (startedRoom) => {
-      setRoom(startedRoom);
+      setRoom(prev => {
+        if (!prev) return startedRoom;
+        return {
+          ...startedRoom,
+          image: startedRoom.image || prev.image
+        };
+      });
       setScreen("GAME");
     });
 
